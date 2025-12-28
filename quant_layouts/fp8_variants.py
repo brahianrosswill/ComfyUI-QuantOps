@@ -5,8 +5,8 @@ These layouts extend ComfyUI's base TensorCoreFP8Layout with finer-grained scali
 - RowWiseFP8Layout: One scale per row (M scales for MxN weight)
 - BlockWiseFP8Layout: One scale per 2D block (MxN blocks)
 
-When Triton is available, these layouts use native FP8 matmul kernels.
-Otherwise, they fall back to dequantization.
+When PyTorch scaled_grouped_mm is available (2.10+), uses native FP8 matmul.
+Otherwise falls back to Triton kernels, then dequantization.
 """
 
 import torch
@@ -30,6 +30,22 @@ try:
 except ImportError:
     _HAS_FP8_KERNELS = False
     logging.debug("FP8 Triton kernels not available, using dequantize fallback")
+
+
+# ==============================================================================
+# PyTorch scaled_grouped_mm support (requires PyTorch 2.10+ and Hopper/Ada GPU)
+# ==============================================================================
+_HAS_GROUPED_MM = False
+_ScalingType = None
+
+try:
+    from torch.nn.functional import scaled_grouped_mm, ScalingType as _ScalingType
+    # Verify the enum has the values we need
+    if hasattr(_ScalingType, 'RowWise') and hasattr(_ScalingType, 'BlockWise1x128'):
+        _HAS_GROUPED_MM = True
+        logging.debug("scaled_grouped_mm available (PyTorch 2.10+)")
+except ImportError:
+    logging.debug("scaled_grouped_mm not available, will use Triton/dequant fallback")
 
 
 class RowWiseFP8Layout(QuantizedLayout):
@@ -207,64 +223,203 @@ class BlockWiseFP8Layout(QuantizedLayout):
 
 
 # ==============================================================================
-# Operation Handlers (dequant-fallback for both layouts)
+# Helper Functions
+# ==============================================================================
+
+def _check_grouped_mm_device_support(device: torch.device) -> bool:
+    """
+    Check if device supports scaled_grouped_mm.
+    
+    Requires Hopper (SM90), Ada (SM89), or ROCm MI300+.
+    """
+    if not _HAS_GROUPED_MM:
+        return False
+    
+    if not device.type == 'cuda':
+        return False
+    
+    try:
+        cap = torch.cuda.get_device_capability(device)
+        # SM89 (Ada) or SM90+ (Hopper)
+        return cap[0] >= 9 or (cap[0] == 8 and cap[1] >= 9)
+    except Exception:
+        return False
+
+
+def _dynamic_fp8_quantize_rowwise(
+    tensor: torch.Tensor,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Dynamically quantize activations with row-wise scaling for scaled_grouped_mm.
+    
+    Args:
+        tensor: Input tensor of shape (..., K)
+        dtype: Target FP8 dtype
+        
+    Returns:
+        (qdata, scale) where scale has shape (..., 1) per row
+    """
+    fp8_max = torch.finfo(dtype).max
+    orig_shape = tensor.shape
+    
+    # Flatten to 2D for row-wise processing
+    tensor_2d = tensor.reshape(-1, orig_shape[-1])
+    
+    # Compute per-row max
+    row_max = tensor_2d.abs().amax(dim=1, keepdim=True)  # (M, 1)
+    scale = row_max / fp8_max
+    scale = scale.clamp_min(1e-12)
+    
+    # Quantize
+    qdata = (tensor_2d / scale).clamp(-fp8_max, fp8_max).to(dtype)
+    
+    # Reshape scale to match grouped_mm expectations (M,)
+    return qdata.reshape(orig_shape), scale.squeeze(-1).to(torch.float32)
+
+
+def _dynamic_fp8_quantize_blockwise(
+    tensor: torch.Tensor,
+    block_size: int = 128,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Dynamically quantize activations with 1xK block-wise scaling for scaled_grouped_mm.
+    
+    For activations, we use 1xblock_size blocks (one scale per block_size elements in K dim).
+    This matches ScalingType.BlockWise1x128.
+    
+    Args:
+        tensor: Input tensor of shape (..., K)
+        block_size: Block size for scaling (default 128)
+        dtype: Target FP8 dtype
+        
+    Returns:
+        (qdata, scale) where scale has shape (..., K//block_size)
+    """
+    fp8_max = torch.finfo(dtype).max
+    orig_shape = tensor.shape
+    K = orig_shape[-1]
+    
+    # Pad if needed
+    if K % block_size != 0:
+        pad_size = block_size - (K % block_size)
+        tensor = torch.nn.functional.pad(tensor, (0, pad_size))
+        K = tensor.shape[-1]
+    
+    # Flatten to 2D for processing
+    tensor_2d = tensor.reshape(-1, K)
+    M = tensor_2d.shape[0]
+    
+    # Reshape to blocks: (M, K//block_size, block_size)
+    tensor_blocks = tensor_2d.reshape(M, K // block_size, block_size)
+    
+    # Compute per-block max
+    block_max = tensor_blocks.abs().amax(dim=2, keepdim=True)  # (M, K//bs, 1)
+    scale = block_max / fp8_max
+    scale = scale.clamp_min(1e-12)
+    
+    # Quantize per block
+    qdata_blocks = (tensor_blocks / scale).clamp(-fp8_max, fp8_max).to(dtype)
+    
+    # Reshape back
+    qdata = qdata_blocks.reshape(M, K)
+    scale = scale.squeeze(-1).to(torch.float32)  # (M, K//block_size)
+    
+    # Trim padding if applied
+    if K != orig_shape[-1]:
+        qdata = qdata[..., :orig_shape[-1]]
+    
+    return qdata.reshape(*orig_shape[:-1], qdata.shape[-1]), scale
+
+
+# ==============================================================================
+# Operation Handlers (scaled_grouped_mm → Triton → dequant fallback chain)
 # ==============================================================================
 
 
 @register_layout_op(torch.ops.aten.linear.default, "RowWiseFP8Layout")
 def rowwise_fp8_linear(func, args, kwargs):
-    """Row-wise FP8 linear operation with native kernel support."""
+    """
+    Row-wise FP8 linear operation.
+    
+    Fallback chain: scaled_grouped_mm → Triton kernels → dequantization
+    """
     input_tensor = args[0]
     weight = args[1]
     bias = args[2] if len(args) > 2 else None
 
-    # Try native FP8 kernel if weight is quantized and Triton available
-    if _HAS_FP8_KERNELS and isinstance(weight, QuantizedTensor):
-        w_qdata, w_scale = RowWiseFP8Layout.get_plain_tensors(weight)
+    if not isinstance(weight, QuantizedTensor):
+        return torch.nn.functional.linear(input_tensor, weight, bias)
 
-        # Check if weight is on CUDA (required for Triton)
-        if w_qdata.is_cuda:
-            orig_dtype = weight._layout_params.get("orig_dtype", torch.float16)
-            # Use a reasonable block size for activation quantization
-            act_block_size = 128
+    w_qdata, w_scale = RowWiseFP8Layout.get_plain_tensors(weight)
+    orig_dtype = weight._layout_params.get("orig_dtype", torch.bfloat16)
+    
+    # Path 1: Try scaled_grouped_mm (PyTorch 2.10+, Hopper/Ada)
+    if _check_grouped_mm_device_support(w_qdata.device):
+        try:
+            # Dynamic activation quantization with row-wise scaling
+            input_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
+            a_qdata, a_scale = _dynamic_fp8_quantize_rowwise(
+                input_2d.to(device=w_qdata.device), 
+                dtype=w_qdata.dtype
+            )
+            
+            logging.debug(
+                f"FP8 rowwise: Using scaled_grouped_mm, "
+                f"input={a_qdata.shape}, weight={w_qdata.shape}"
+            )
+            
+            # Weight needs transpose for linear: input @ weight.T
+            result = scaled_grouped_mm(
+                a_qdata,
+                w_qdata.t().contiguous(),
+                a_scale, _ScalingType.RowWise,
+                w_scale, _ScalingType.RowWise,
+                bias=bias,
+                output_dtype=orig_dtype,
+            )
+            
+            # Reshape back if needed
+            if len(input_tensor.shape) > 2:
+                result = result.reshape(*input_tensor.shape[:-1], -1)
+            
+            return result
+            
+        except Exception as e:
+            logging.debug(f"scaled_grouped_mm failed, trying Triton: {e}")
 
-            # Input needs to be quantized for rowwise kernel
-            if input_tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
-                try:
-                    # Quantize input to FP8 blockwise
-                    a_qdata, a_scale = fp8_act_quant(
-                        input_tensor.to(device=w_qdata.device),
-                        block_size=act_block_size,
-                        dtype=w_qdata.dtype,
-                    )
+    # Path 2: Try Triton FP8 kernels
+    if _HAS_FP8_KERNELS and w_qdata.is_cuda:
+        act_block_size = 128
+        if input_tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
+            try:
+                a_qdata, a_scale = fp8_act_quant(
+                    input_tensor.to(device=w_qdata.device),
+                    block_size=act_block_size,
+                    dtype=w_qdata.dtype,
+                )
 
-                    logging.debug(
-                        f"FP8 rowwise: Native kernel (dynamic quant), "
-                        f"input={a_qdata.shape}, weight={w_qdata.shape}"
-                    )
+                logging.debug(
+                    f"FP8 rowwise: Using Triton kernel, "
+                    f"input={a_qdata.shape}, weight={w_qdata.shape}"
+                )
 
-                    # For rowwise, bias needs manual addition (no fused kernel yet)
-                    result = fp8_gemm_rowwise(
-                        a_qdata,
-                        a_scale,
-                        w_qdata,
-                        w_scale,
-                        input_block_size=act_block_size,
-                    )
+                result = fp8_gemm_rowwise(
+                    a_qdata, a_scale, w_qdata, w_scale,
+                    input_block_size=act_block_size,
+                )
 
-                    if bias is not None:
-                        result = result + bias.to(
-                            device=result.device, dtype=result.dtype
-                        )
+                if bias is not None:
+                    result = result + bias.to(device=result.device, dtype=result.dtype)
 
-                    return result.to(orig_dtype)
-                except Exception as e:
-                    logging.warning(f"FP8 rowwise native kernel failed: {e}")
+                return result.to(orig_dtype)
+            except Exception as e:
+                logging.debug(f"Triton kernel failed: {e}")
 
-    # Fallback: dequantize
+    # Path 3: Dequantize fallback
     logging.debug("FP8 rowwise: Using dequant fallback")
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
+    weight = weight.dequantize()
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
@@ -319,96 +474,124 @@ def rowwise_fp8_func(func, args, kwargs):
 
 @register_layout_op(torch.ops.aten.linear.default, "BlockWiseFP8Layout")
 def blockwise_fp8_linear(func, args, kwargs):
-    """Block-wise FP8 linear operation with native kernel support."""
+    """
+    Block-wise FP8 linear operation.
+    
+    Fallback chain: scaled_grouped_mm → Triton kernels → dequantization
+    """
     input_tensor = args[0]
     weight = args[1]
     bias = args[2] if len(args) > 2 else None
 
-    # Try native FP8 kernel if both are quantized and Triton available
-    if _HAS_FP8_KERNELS and isinstance(weight, QuantizedTensor):
-        w_qdata, w_scale, w_block_size = BlockWiseFP8Layout.get_plain_tensors(weight)
+    if not isinstance(weight, QuantizedTensor):
+        return torch.nn.functional.linear(input_tensor, weight, bias)
 
-        # Check if weight is on CUDA (required for Triton)
-        if w_qdata.is_cuda:
-            orig_dtype = weight._layout_params.get("orig_dtype", torch.float16)
+    w_qdata, w_scale, w_block_size = BlockWiseFP8Layout.get_plain_tensors(weight)
+    orig_dtype = weight._layout_params.get("orig_dtype", torch.bfloat16)
+    
+    # Path 1: Try scaled_grouped_mm (PyTorch 2.10+, Hopper/Ada)
+    if _check_grouped_mm_device_support(w_qdata.device):
+        # Map block_size to ScalingType
+        scaling_type_map = {
+            16: _ScalingType.BlockWise1x16 if _ScalingType else None,
+            32: _ScalingType.BlockWise1x32 if _ScalingType else None,
+            128: _ScalingType.BlockWise1x128 if _ScalingType else None,
+        }
+        w_scaling_type = scaling_type_map.get(w_block_size, _ScalingType.BlockWise1x128 if _ScalingType else None)
+        
+        if w_scaling_type is not None:
+            try:
+                # Dynamic activation quantization with blockwise scaling
+                input_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
+                a_qdata, a_scale = _dynamic_fp8_quantize_blockwise(
+                    input_2d.to(device=w_qdata.device),
+                    block_size=w_block_size,
+                    dtype=w_qdata.dtype,
+                )
+                
+                logging.debug(
+                    f"FP8 blockwise: Using scaled_grouped_mm, "
+                    f"input={a_qdata.shape}, weight={w_qdata.shape}, block_size={w_block_size}"
+                )
+                
+                # Weight needs transpose for linear: input @ weight.T
+                result = scaled_grouped_mm(
+                    a_qdata,
+                    w_qdata.t().contiguous(),
+                    a_scale, _ScalingType.BlockWise1x128,  # Activations use 1xK blocks
+                    w_scale, w_scaling_type,
+                    bias=bias,
+                    output_dtype=orig_dtype,
+                )
+                
+                # Reshape back if needed
+                if len(input_tensor.shape) > 2:
+                    result = result.reshape(*input_tensor.shape[:-1], -1)
+                
+                return result
+                
+            except Exception as e:
+                logging.debug(f"scaled_grouped_mm failed, trying Triton: {e}")
 
-            # If input is already quantized FP8, use it directly
-            if isinstance(input_tensor, QuantizedTensor):
-                a_qdata, a_scale, a_block_size = BlockWiseFP8Layout.get_plain_tensors(
-                    input_tensor
+    # Path 2: Try Triton FP8 kernels
+    if _HAS_FP8_KERNELS and w_qdata.is_cuda:
+        # If input is already quantized FP8, use it directly
+        if isinstance(input_tensor, QuantizedTensor):
+            try:
+                a_qdata, a_scale, a_block_size = BlockWiseFP8Layout.get_plain_tensors(input_tensor)
+                
+                logging.debug(
+                    f"FP8 blockwise: Using Triton kernel (both quantized), "
+                    f"input={a_qdata.shape}, weight={w_qdata.shape}"
+                )
+                
+                if bias is not None:
+                    result = fp8_addmm_blockwise(
+                        a_qdata, a_scale, w_qdata, w_scale,
+                        bias=bias.to(device=a_qdata.device),
+                        input_block_size=w_block_size,
+                    )
+                else:
+                    result = fp8_gemm_blockwise(
+                        a_qdata, a_scale, w_qdata, w_scale,
+                        input_block_size=w_block_size,
+                    )
+                return result.to(orig_dtype)
+            except Exception as e:
+                logging.debug(f"Triton kernel (pre-quantized) failed: {e}")
+        
+        # Dynamically quantize input
+        elif input_tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
+            try:
+                a_qdata, a_scale = fp8_act_quant(
+                    input_tensor.to(device=w_qdata.device),
+                    block_size=w_block_size,
+                    dtype=w_qdata.dtype,
                 )
 
                 logging.debug(
-                    f"FP8 blockwise: Native kernel (both quantized), "
-                    f"input={a_qdata.shape}, weight={w_qdata.shape}, block_size={w_block_size}"
+                    f"FP8 blockwise: Using Triton kernel (dynamic quant), "
+                    f"input={a_qdata.shape}, weight={w_qdata.shape}"
                 )
 
-                try:
-                    if bias is not None:
-                        result = fp8_addmm_blockwise(
-                            a_qdata,
-                            a_scale,
-                            w_qdata,
-                            w_scale,
-                            bias=bias.to(device=a_qdata.device),
-                            input_block_size=w_block_size,
-                        )
-                    else:
-                        result = fp8_gemm_blockwise(
-                            a_qdata,
-                            a_scale,
-                            w_qdata,
-                            w_scale,
-                            input_block_size=w_block_size,
-                        )
-                    return result.to(orig_dtype)
-                except Exception as e:
-                    logging.warning(
-                        f"FP8 native kernel failed, falling back to dequant: {e}"
+                if bias is not None:
+                    result = fp8_addmm_blockwise(
+                        a_qdata, a_scale, w_qdata, w_scale,
+                        bias=bias.to(device=a_qdata.device),
+                        input_block_size=w_block_size,
                     )
-
-            # Input is not quantized - quantize it dynamically
-            elif input_tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
-                try:
-                    # Quantize input to FP8
-                    a_qdata, a_scale = fp8_act_quant(
-                        input_tensor.to(device=w_qdata.device),
-                        block_size=w_block_size,
-                        dtype=w_qdata.dtype,
+                else:
+                    result = fp8_gemm_blockwise(
+                        a_qdata, a_scale, w_qdata, w_scale,
+                        input_block_size=w_block_size,
                     )
+                return result.to(orig_dtype)
+            except Exception as e:
+                logging.debug(f"Triton kernel (dynamic quant) failed: {e}")
 
-                    logging.debug(
-                        f"FP8 blockwise: Native kernel (dynamic quant), "
-                        f"input={a_qdata.shape}, weight={w_qdata.shape}"
-                    )
-
-                    if bias is not None:
-                        result = fp8_addmm_blockwise(
-                            a_qdata,
-                            a_scale,
-                            w_qdata,
-                            w_scale,
-                            bias=bias.to(device=a_qdata.device),
-                            input_block_size=w_block_size,
-                        )
-                    else:
-                        result = fp8_gemm_blockwise(
-                            a_qdata,
-                            a_scale,
-                            w_qdata,
-                            w_scale,
-                            input_block_size=w_block_size,
-                        )
-                    return result.to(orig_dtype)
-                except Exception as e:
-                    logging.warning(
-                        f"FP8 dynamic quant failed, falling back to dequant: {e}"
-                    )
-
-    # Fallback: dequantize
+    # Path 3: Dequantize fallback
     logging.debug("FP8 blockwise: Using dequant fallback")
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
+    weight = weight.dequantize()
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
