@@ -230,7 +230,8 @@ def _check_grouped_mm_device_support(device: torch.device) -> bool:
     """
     Check if device supports scaled_grouped_mm.
     
-    Requires Hopper (SM90), Ada (SM89), or ROCm MI300+.
+    PyTorch currently only supports compute capability 9.0 and 10.0.
+    Ada (8.9), Hopper (9.0), but NOT Blackwell SM 12.0 yet.
     """
     if not _HAS_GROUPED_MM:
         return False
@@ -239,9 +240,10 @@ def _check_grouped_mm_device_support(device: torch.device) -> bool:
         return False
     
     try:
-        cap = torch.cuda.get_device_capability(device)
-        # SM89 (Ada) or SM90+ (Hopper)
-        return cap[0] >= 9 or (cap[0] == 8 and cap[1] >= 9)
+        major, minor = torch.cuda.get_device_capability(device)
+        # PyTorch only supports SM 9.0 and 10.0 for scaled_grouped_mm
+        # SM 8.9 (Ada), SM 9.0 (Hopper), SM 10.0 - but NOT SM 12.0 (Blackwell) yet
+        return (major == 9 and minor == 0) or (major == 10 and minor == 0) or (major == 8 and minor == 9)
     except Exception:
         return False
 
@@ -589,10 +591,8 @@ def blockwise_fp8_linear(func, args, kwargs):
             try:
                 a_qdata, a_scale, a_block_size = BlockWiseFP8Layout.get_plain_tensors(input_tensor)
                 
-                logging.debug(
-                    f"FP8 blockwise: Using Triton kernel (both quantized), "
-                    f"input={a_qdata.shape}, weight={w_qdata.shape}"
-                )
+                if layer_id not in _blockwise_logged_layers:
+                    print(f"[QuantOps] Using Triton FP8 kernel (pre-quantized)")
                 
                 if bias is not None:
                     result = fp8_addmm_blockwise(
@@ -607,7 +607,8 @@ def blockwise_fp8_linear(func, args, kwargs):
                     )
                 return result.to(orig_dtype)
             except Exception as e:
-                logging.debug(f"Triton kernel (pre-quantized) failed: {e}")
+                if layer_id not in _blockwise_logged_layers:
+                    print(f"[QuantOps] Triton (pre-quant) FAILED: {e}")
         
         # Dynamically quantize input
         elif input_tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
@@ -618,10 +619,8 @@ def blockwise_fp8_linear(func, args, kwargs):
                     dtype=w_qdata.dtype,
                 )
 
-                logging.debug(
-                    f"FP8 blockwise: Using Triton kernel (dynamic quant), "
-                    f"input={a_qdata.shape}, weight={w_qdata.shape}"
-                )
+                if layer_id not in _blockwise_logged_layers:
+                    print(f"[QuantOps] Using Triton FP8 kernel (dynamic quant)")
 
                 if bias is not None:
                     result = fp8_addmm_blockwise(
@@ -636,10 +635,13 @@ def blockwise_fp8_linear(func, args, kwargs):
                     )
                 return result.to(orig_dtype)
             except Exception as e:
-                logging.debug(f"Triton kernel (dynamic quant) failed: {e}")
+                if layer_id not in _blockwise_logged_layers:
+                    print(f"[QuantOps] Triton (dynamic quant) FAILED: {e}")
 
     # Path 3: Dequantize fallback
-    logging.debug("FP8 blockwise: Using dequant fallback")
+    if layer_id not in _blockwise_logged_layers:
+        print(f"[QuantOps] Using dequant fallback (SLOW)")
+    
     weight = weight.dequantize()
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
