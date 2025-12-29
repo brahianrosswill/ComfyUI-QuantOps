@@ -230,8 +230,9 @@ def _check_grouped_mm_device_support(device: torch.device) -> bool:
     """
     Check if device supports scaled_grouped_mm.
     
-    PyTorch currently only supports compute capability 9.0 and 10.0.
-    Ada (8.9), Hopper (9.0), but NOT Blackwell SM 12.0 yet.
+    PyTorch ONLY supports compute capability 9.0 (Hopper) and 10.0.
+    NOT supported: SM 8.9 (Ada/RTX 40), SM 12.0 (Blackwell/RTX 50).
+    Basically datacenter Hopper only.
     """
     if not _HAS_GROUPED_MM:
         return False
@@ -241,9 +242,8 @@ def _check_grouped_mm_device_support(device: torch.device) -> bool:
     
     try:
         major, minor = torch.cuda.get_device_capability(device)
-        # PyTorch only supports SM 9.0 and 10.0 for scaled_grouped_mm
-        # SM 8.9 (Ada), SM 9.0 (Hopper), SM 10.0 - but NOT SM 12.0 (Blackwell) yet
-        return (major == 9 and minor == 0) or (major == 10 and minor == 0) or (major == 8 and minor == 9)
+        # PyTorch ONLY supports SM 9.0 and 10.0 - datacenter Hopper only
+        return (major == 9 and minor == 0) or (major == 10 and minor == 0)
     except Exception:
         return False
 
