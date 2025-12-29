@@ -11,6 +11,97 @@ import logging
 import folder_paths
 import comfy.sd
 import comfy.utils
+from safetensors import safe_open
+
+
+def detect_quant_format(model_path: str) -> str:
+    """
+    Detect quantization format by inspecting .comfy_quant metadata in the model.
+    
+    Returns one of: "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", 
+                    "float8_e4m3fn_rowwise", or "unknown"
+    """
+    detected_formats = set()
+    
+    try:
+        with safe_open(model_path, framework="pt", device="cpu") as f:
+            keys = list(f.keys())
+            
+            # Look for .comfy_quant tensors
+            for key in keys:
+                if key.endswith(".comfy_quant"):
+                    try:
+                        quant_tensor = f.get_tensor(key)
+                        # Extract format from the tensor data
+                        # comfy_quant is a 1D tensor with format info encoded
+                        if quant_tensor.numel() >= 1:
+                            format_code = int(quant_tensor[0].item())
+                            # Format codes from quant_ops QUANT_ALGOS
+                            format_map = {
+                                0: "float8_e4m3fn",
+                                1: "float8_e4m3fn_rowwise",
+                                2: "float8_e4m3fn_blockwise",
+                                3: "float8_e4m3fn_block3d",
+                                10: "int8_blockwise",
+                            }
+                            fmt = format_map.get(format_code)
+                            if fmt:
+                                detected_formats.add(fmt)
+                    except Exception:
+                        pass
+            
+            # If no .comfy_quant found, try to infer from tensor dtypes and scale shapes
+            if not detected_formats:
+                has_fp8 = False
+                has_int8 = False
+                has_rowwise_scale = False
+                has_blockwise_scale = False
+                
+                for key in keys:
+                    if key.endswith(".weight"):
+                        try:
+                            info = f.get_tensor(key)
+                            if info.dtype.is_floating_point and "float8" in str(info.dtype):
+                                has_fp8 = True
+                            elif info.dtype == "int8" or str(info.dtype) == "torch.int8":
+                                has_int8 = True
+                        except Exception:
+                            pass
+                    elif key.endswith(".weight_scale") or key.endswith(".scale_weight"):
+                        try:
+                            scale = f.get_tensor(key)
+                            if scale.ndim == 1:
+                                has_rowwise_scale = True
+                            elif scale.ndim == 2:
+                                has_blockwise_scale = True
+                        except Exception:
+                            pass
+                
+                if has_int8:
+                    detected_formats.add("int8_blockwise")
+                elif has_fp8:
+                    if has_blockwise_scale:
+                        detected_formats.add("float8_e4m3fn_blockwise")
+                    elif has_rowwise_scale:
+                        detected_formats.add("float8_e4m3fn_rowwise")
+                    else:
+                        detected_formats.add("float8_e4m3fn")
+                        
+    except Exception as e:
+        logging.warning(f"Failed to detect quant format from {model_path}: {e}")
+        return "unknown"
+    
+    # Return the most specific format found
+    if "int8_blockwise" in detected_formats:
+        return "int8"
+    elif "float8_e4m3fn_blockwise" in detected_formats:
+        return "float8_e4m3fn_blockwise"
+    elif "float8_e4m3fn_rowwise" in detected_formats:
+        return "float8_e4m3fn_rowwise"
+    elif "float8_e4m3fn" in detected_formats:
+        return "float8_e4m3fn"
+    
+    return "unknown"
 
 
 class QuantizedModelLoader:
@@ -102,14 +193,27 @@ class QuantizedModelLoader:
             except ImportError as e:
                 logging.warning(f"HybridFP8Ops not available: {e}")
         else:  # auto
-            # Try INT8 as fallback for auto mode
-            try:
-                from ..int8_ops import HybridINT8Ops
-
-                model_options = {"custom_operations": HybridINT8Ops}
-                logging.info("QuantizedModelLoader: Auto-selected HybridINT8Ops")
-            except ImportError as e:
-                logging.warning(f"No quantized ops available: {e}")
+            # Detect format from model metadata
+            detected = detect_quant_format(ckpt_path)
+            logging.info(f"QuantizedModelLoader: Auto-detected format: {detected}")
+            
+            if detected == "int8":
+                try:
+                    from ..int8_ops import HybridINT8Ops
+                    model_options = {"custom_operations": HybridINT8Ops}
+                except ImportError as e:
+                    logging.warning(f"HybridINT8Ops not available: {e}")
+            elif detected in ("float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise"):
+                try:
+                    from ..fp8_ops import HybridFP8Ops
+                    model_options = {"custom_operations": HybridFP8Ops}
+                except ImportError as e:
+                    logging.warning(f"HybridFP8Ops not available: {e}")
+            elif detected == "float8_e4m3fn":
+                # Tensor-wise FP8 uses ComfyUI built-in
+                pass
+            else:
+                logging.warning(f"Unknown quant format, using default loading")
 
         # Use ComfyUI's checkpoint loading with our custom operations
         out = comfy.sd.load_checkpoint_guess_config(
@@ -205,13 +309,25 @@ class QuantizedUNETLoader:
             except ImportError as e:
                 logging.warning(f"HybridFP8Ops not available: {e}")
         else:  # auto
-            try:
-                from ..int8_ops import HybridINT8Ops
-
-                model_options = {"custom_operations": HybridINT8Ops}
-                logging.info("QuantizedUNETLoader: Auto-selected HybridINT8Ops")
-            except ImportError as e:
-                logging.warning(f"No quantized ops available: {e}")
+            detected = detect_quant_format(unet_path)
+            logging.info(f"QuantizedUNETLoader: Auto-detected format: {detected}")
+            
+            if detected == "int8":
+                try:
+                    from ..int8_ops import HybridINT8Ops
+                    model_options = {"custom_operations": HybridINT8Ops}
+                except ImportError as e:
+                    logging.warning(f"HybridINT8Ops not available: {e}")
+            elif detected in ("float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise"):
+                try:
+                    from ..fp8_ops import HybridFP8Ops
+                    model_options = {"custom_operations": HybridFP8Ops}
+                except ImportError as e:
+                    logging.warning(f"HybridFP8Ops not available: {e}")
+            elif detected == "float8_e4m3fn":
+                pass
+            else:
+                logging.warning(f"Unknown quant format, using default loading")
 
         # Standard loading path
         model = comfy.sd.load_diffusion_model(unet_path, model_options=model_options)
@@ -221,9 +337,9 @@ class QuantizedUNETLoader:
 
 class QuantizedCLIPLoader:
     """
-    Load CLIP/text encoders with INT8 blockwise quantization.
+    Load CLIP/text encoders with quantization support.
 
-    Supports text encoders quantized by convert_to_quant with --int8 --comfy_quant.
+    Supports text encoders quantized by convert_to_quant.
     """
 
     # CLIPType options matching built-in CLIPLoader from nodes.py
@@ -256,6 +372,7 @@ class QuantizedCLIPLoader:
             "required": {
                 "clip_name": (folder_paths.get_filename_list("text_encoders"),),
                 "type": (cls.CLIP_TYPES,),
+                "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise"],),
                 "kernel_backend": (["pytorch", "triton"],),
             },
         }
@@ -263,26 +380,30 @@ class QuantizedCLIPLoader:
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "load_clip"
     CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load INT8-quantized text encoders (CLIP, T5, etc.)"
+    DESCRIPTION = "Load quantized text encoders (CLIP, T5, etc.)"
 
-    def load_clip(self, clip_name, type, kernel_backend):
-        """Load a CLIP/text encoder with INT8 quantization support."""
+    def load_clip(self, clip_name, type, quant_format, kernel_backend):
+        """Load a CLIP/text encoder with quantization support."""
         import comfy.model_management
-
-        # Configure INT8 kernel backend
-        try:
-            from ..quant_layouts.int8_layout import BlockWiseINT8Layout
-
-            BlockWiseINT8Layout.set_backend(kernel_backend)
-            logging.debug(
-                f"QuantizedCLIPLoader: Configured INT8 backend to '{kernel_backend}'"
-            )
-        except Exception as e:
-            if kernel_backend == "triton":
-                logging.warning(f"Failed to configure Triton backend: {e}")
 
         # Get clip path
         clip_path = folder_paths.get_full_path("text_encoders", clip_name)
+
+        # Configure INT8 kernel backend if applicable
+        if quant_format in ("auto", "int8"):
+            try:
+                from ..quant_layouts.int8_layout import BlockWiseINT8Layout
+                BlockWiseINT8Layout.set_backend(kernel_backend)
+            except Exception as e:
+                if kernel_backend == "triton":
+                    logging.warning(f"Failed to configure Triton backend: {e}")
+
+        # Determine actual format
+        if quant_format == "auto":
+            detected = detect_quant_format(clip_path)
+            logging.info(f"QuantizedCLIPLoader: Auto-detected format: {detected}")
+        else:
+            detected = quant_format
 
         # Convert type string to CLIPType enum
         clip_type = getattr(
@@ -292,19 +413,30 @@ class QuantizedCLIPLoader:
         # Load state dict
         sd = comfy.utils.load_torch_file(clip_path, safe_load=True)
 
-        # Set up model options with our custom INT8 ops
+        # Set up model options
         model_options = {
             "initial_device": comfy.model_management.text_encoder_offload_device()
         }
-        try:
-            from ..int8_ops import HybridINT8Ops
 
-            model_options["custom_operations"] = HybridINT8Ops
-            logging.info(
-                "QuantizedCLIPLoader: Using HybridINT8Ops for INT8 text encoder"
-            )
-        except ImportError as e:
-            logging.warning(f"HybridINT8Ops not available: {e}")
+        # Select ops based on detected format
+        if detected == "int8":
+            try:
+                from ..int8_ops import HybridINT8Ops
+                model_options["custom_operations"] = HybridINT8Ops
+                logging.info("QuantizedCLIPLoader: Using HybridINT8Ops")
+            except ImportError as e:
+                logging.warning(f"HybridINT8Ops not available: {e}")
+        elif detected in ("float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise"):
+            try:
+                from ..fp8_ops import HybridFP8Ops
+                model_options["custom_operations"] = HybridFP8Ops
+                logging.info(f"QuantizedCLIPLoader: Using HybridFP8Ops for {detected}")
+            except ImportError as e:
+                logging.warning(f"HybridFP8Ops not available: {e}")
+        elif detected == "float8_e4m3fn":
+            logging.info("QuantizedCLIPLoader: Using ComfyUI built-in for tensor-scaled FP8")
+        else:
+            logging.warning(f"QuantizedCLIPLoader: Unknown format {detected}, using default")
 
         # Load text encoder using ComfyUI's API
         clip = comfy.sd.load_text_encoder_state_dicts(
