@@ -530,17 +530,13 @@ def blockwise_fp8_linear(func, args, kwargs):
 
     # Debug: log once per layer
     layer_id = id(weight)
-    if layer_id not in _blockwise_logged_layers:
-        print(f"[QuantOps] blockwise_fp8_linear: weight shape={weight.shape}")
-        _blockwise_logged_layers.add(layer_id)
-
+    
     w_qdata, w_scale, w_block_size = BlockWiseFP8Layout.get_plain_tensors(weight)
     orig_dtype = weight._layout_params.get("orig_dtype", torch.bfloat16)
     
-    # Debug: log path taken (once)
     if layer_id not in _blockwise_logged_layers:
         device_ok = _check_grouped_mm_device_support(w_qdata.device)
-        print(f"[QuantOps] block_size={w_block_size}, device_support={device_ok}, _HAS_GROUPED_MM={_HAS_GROUPED_MM}")
+        print(f"[QuantOps] blockwise: shape={weight.shape}, block_size={w_block_size}, device_ok={device_ok}, HAS_GROUPED_MM={_HAS_GROUPED_MM}")
         _blockwise_logged_layers.add(layer_id)
     
     # Path 1: Try scaled_grouped_mm (PyTorch 2.10+, Hopper/Ada/Blackwell)
