@@ -580,7 +580,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                 return result
                 
             except Exception as e:
-                logging.debug(f"scaled_grouped_mm failed, trying Triton: {e}")
+                print(f"[QuantOps] scaled_grouped_mm FAILED: {e}")
 
     # Path 2: Try Triton FP8 kernels
     if _HAS_FP8_KERNELS and w_qdata.is_cuda:
