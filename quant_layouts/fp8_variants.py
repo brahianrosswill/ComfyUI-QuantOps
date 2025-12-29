@@ -530,18 +530,14 @@ def blockwise_fp8_linear(func, args, kwargs):
     if not isinstance(weight, QuantizedTensor):
         return torch.nn.functional.linear(input_tensor, weight, bias)
 
-    # Debug: log once per layer
+    # Track which layers we've logged
     layer_id = id(weight)
+    should_log = layer_id not in _blockwise_logged_layers
     
     w_qdata, w_scale, w_block_size = BlockWiseFP8Layout.get_plain_tensors(weight)
     orig_dtype = weight._layout_params.get("orig_dtype", torch.bfloat16)
     
-    if layer_id not in _blockwise_logged_layers:
-        device_ok = _check_grouped_mm_device_support(w_qdata.device)
-        print(f"[QuantOps] blockwise: shape={weight.shape}, block_size={w_block_size}, device_ok={device_ok}, HAS_GROUPED_MM={_HAS_GROUPED_MM}")
-        _blockwise_logged_layers.add(layer_id)
-    
-    # Path 1: Try scaled_grouped_mm (PyTorch 2.10+, Hopper/Ada/Blackwell)
+    # Path 1: Try scaled_grouped_mm (PyTorch - Hopper datacenter only)
     if _check_grouped_mm_device_support(w_qdata.device):
         # Map block_size to ScalingType
         scaling_type_map = {
@@ -561,8 +557,8 @@ def blockwise_fp8_linear(func, args, kwargs):
                     dtype=w_qdata.dtype,
                 )
                 
-                if layer_id not in _blockwise_logged_layers:
-                    print(f"[QuantOps] Using scaled_grouped_mm, block_size={w_block_size}")
+                if should_log:
+                    print(f"[QuantOps] blockwise: Using scaled_grouped_mm (Hopper), block_size={w_block_size}")
                     _blockwise_logged_layers.add(layer_id)
                 
                 # Weight needs transpose for linear: input @ weight.T
@@ -582,7 +578,8 @@ def blockwise_fp8_linear(func, args, kwargs):
                 return result
                 
             except Exception as e:
-                print(f"[QuantOps] scaled_grouped_mm FAILED: {e}")
+                if should_log:
+                    print(f"[QuantOps] scaled_grouped_mm FAILED: {e}")
 
     # Path 2: Try Triton FP8 kernels
     if _HAS_FP8_KERNELS and w_qdata.is_cuda:
@@ -590,9 +587,6 @@ def blockwise_fp8_linear(func, args, kwargs):
         if isinstance(input_tensor, QuantizedTensor):
             try:
                 a_qdata, a_scale, a_block_size = BlockWiseFP8Layout.get_plain_tensors(input_tensor)
-                
-                if layer_id not in _blockwise_logged_layers:
-                    print(f"[QuantOps] Using Triton FP8 kernel (pre-quantized)")
                 
                 if bias is not None:
                     result = fp8_addmm_blockwise(
@@ -605,9 +599,14 @@ def blockwise_fp8_linear(func, args, kwargs):
                         a_qdata, a_scale, w_qdata, w_scale,
                         input_block_size=w_block_size,
                     )
+                
+                if should_log:
+                    print(f"[QuantOps] blockwise: Using Triton (pre-quant), block_size={w_block_size}")
+                    _blockwise_logged_layers.add(layer_id)
+                
                 return result.to(orig_dtype)
             except Exception as e:
-                if layer_id not in _blockwise_logged_layers:
+                if should_log:
                     print(f"[QuantOps] Triton (pre-quant) FAILED: {e}")
         
         # Dynamically quantize input
@@ -619,9 +618,6 @@ def blockwise_fp8_linear(func, args, kwargs):
                     dtype=w_qdata.dtype,
                 )
 
-                if layer_id not in _blockwise_logged_layers:
-                    print(f"[QuantOps] Using Triton FP8 kernel (dynamic quant)")
-
                 if bias is not None:
                     result = fp8_addmm_blockwise(
                         a_qdata, a_scale, w_qdata, w_scale,
@@ -633,14 +629,20 @@ def blockwise_fp8_linear(func, args, kwargs):
                         a_qdata, a_scale, w_qdata, w_scale,
                         input_block_size=w_block_size,
                     )
+                
+                if should_log:
+                    print(f"[QuantOps] blockwise: Using Triton (dynamic quant), block_size={w_block_size}")
+                    _blockwise_logged_layers.add(layer_id)
+                
                 return result.to(orig_dtype)
             except Exception as e:
-                if layer_id not in _blockwise_logged_layers:
+                if should_log:
                     print(f"[QuantOps] Triton (dynamic quant) FAILED: {e}")
 
     # Path 3: Dequantize fallback
-    if layer_id not in _blockwise_logged_layers:
-        print(f"[QuantOps] Using dequant fallback (SLOW)")
+    if should_log:
+        print(f"[QuantOps] blockwise: Using DEQUANT FALLBACK (slow), block_size={w_block_size}")
+        _blockwise_logged_layers.add(layer_id)
     
     weight = weight.dequantize()
     if isinstance(input_tensor, QuantizedTensor):
