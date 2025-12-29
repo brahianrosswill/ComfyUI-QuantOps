@@ -338,8 +338,8 @@ if _HAS_TRITON:
             k_start = k_idx * BLOCK_SIZE_K
 
             mask_k = offs_k < K - k_start
-            a_fp8 = tl.load(a_ptrs, mask=mask_k[None, :], other=0)
-            b_fp8 = tl.load(b_ptrs, mask=mask_k[:, None], other=0)
+            a_fp8 = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+            b_fp8 = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
 
             a_f32 = a_fp8.to(tl.float32)
             b_f32 = b_fp8.to(tl.float32)
