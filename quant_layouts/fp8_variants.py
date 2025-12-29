@@ -511,6 +511,9 @@ def rowwise_fp8_func(func, args, kwargs):
     return func(*args, **kwargs)
 
 
+# Debug: track which layers have been logged
+_blockwise_logged_layers = set()
+
 @register_layout_op(torch.ops.aten.linear.default, "BlockWiseFP8Layout")
 def blockwise_fp8_linear(func, args, kwargs):
     """
@@ -518,14 +521,18 @@ def blockwise_fp8_linear(func, args, kwargs):
     
     Fallback chain: scaled_grouped_mm → Triton kernels → dequantization
     """
-    print("[QuantOps] blockwise_fp8_linear handler called")  # Debug
-    
     input_tensor = args[0]
     weight = args[1]
     bias = args[2] if len(args) > 2 else None
 
     if not isinstance(weight, QuantizedTensor):
         return torch.nn.functional.linear(input_tensor, weight, bias)
+
+    # Debug: log once per layer
+    layer_id = id(weight)
+    if layer_id not in _blockwise_logged_layers:
+        print(f"[QuantOps] blockwise_fp8_linear: weight shape={weight.shape}")
+        _blockwise_logged_layers.add(layer_id)
 
     w_qdata, w_scale, w_block_size = BlockWiseFP8Layout.get_plain_tensors(weight)
     orig_dtype = weight._layout_params.get("orig_dtype", torch.bfloat16)
@@ -542,7 +549,6 @@ def blockwise_fp8_linear(func, args, kwargs):
         
         if w_scaling_type is not None:
             try:
-                print(f"[QuantOps] Attempting scaled_grouped_mm, block_size={w_block_size}")  # Debug
                 # Dynamic activation quantization with blockwise scaling
                 input_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
                 a_qdata, a_scale = _dynamic_fp8_quantize_blockwise(
@@ -551,7 +557,9 @@ def blockwise_fp8_linear(func, args, kwargs):
                     dtype=w_qdata.dtype,
                 )
                 
-                print(f"[QuantOps] scaled_grouped_mm: input={a_qdata.shape}, weight={w_qdata.shape}")  # Debug
+                if layer_id not in _blockwise_logged_layers:
+                    print(f"[QuantOps] Using scaled_grouped_mm, block_size={w_block_size}")
+                    _blockwise_logged_layers.add(layer_id)
                 
                 # Weight needs transpose for linear: input @ weight.T
                 result = scaled_grouped_mm(
