@@ -518,6 +518,8 @@ def blockwise_fp8_linear(func, args, kwargs):
     
     Fallback chain: scaled_grouped_mm → Triton kernels → dequantization
     """
+    print("[QuantOps] blockwise_fp8_linear handler called")  # Debug
+    
     input_tensor = args[0]
     weight = args[1]
     bias = args[2] if len(args) > 2 else None
@@ -540,6 +542,7 @@ def blockwise_fp8_linear(func, args, kwargs):
         
         if w_scaling_type is not None:
             try:
+                print(f"[QuantOps] Attempting scaled_grouped_mm, block_size={w_block_size}")  # Debug
                 # Dynamic activation quantization with blockwise scaling
                 input_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
                 a_qdata, a_scale = _dynamic_fp8_quantize_blockwise(
@@ -548,10 +551,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                     dtype=w_qdata.dtype,
                 )
                 
-                logging.debug(
-                    f"FP8 blockwise: Using scaled_grouped_mm, "
-                    f"input={a_qdata.shape}, weight={w_qdata.shape}, block_size={w_block_size}"
-                )
+                print(f"[QuantOps] scaled_grouped_mm: input={a_qdata.shape}, weight={w_qdata.shape}")  # Debug
                 
                 # Weight needs transpose for linear: input @ weight.T
                 result = scaled_grouped_mm(
