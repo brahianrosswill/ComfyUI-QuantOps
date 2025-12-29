@@ -246,9 +246,35 @@ def _check_grouped_mm_device_support(device: torch.device) -> bool:
         return False
 
 
+def _fast_fp8_quantize(
+    tensor: torch.Tensor,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fast activation quantization using fixed scale=1.0 with clamp.
+    
+    This is significantly faster than dynamic scale computation because it
+    avoids the per-forward amax() reduction. Trades some precision for speed.
+    Used by Hybrid Loader for optimal inference throughput.
+    
+    Args:
+        tensor: Input tensor of any shape
+        dtype: Target FP8 dtype
+        
+    Returns:
+        (qdata, scale) where scale is always 1.0
+    """
+    fp8_max = torch.finfo(dtype).max
+    # Clamp to FP8 representable range and cast directly
+    qdata = torch.clamp(tensor, min=-fp8_max, max=fp8_max).to(dtype)
+    scale = torch.ones((), device=tensor.device, dtype=torch.float32)
+    return qdata, scale
+
+
 def _dynamic_fp8_quantize_rowwise(
     tensor: torch.Tensor,
     dtype: torch.dtype = torch.float8_e4m3fn,
+    use_fast_path: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Dynamically quantize activations with row-wise scaling for scaled_grouped_mm.
@@ -256,10 +282,16 @@ def _dynamic_fp8_quantize_rowwise(
     Args:
         tensor: Input tensor of shape (..., K)
         dtype: Target FP8 dtype
+        use_fast_path: If True, use fast clamp-based quantization (recommended)
         
     Returns:
-        (qdata, scale) where scale has shape (..., 1) per row
+        (qdata, scale) where scale has shape (M,) for row-wise or () for fast path
     """
+    # Fast path: fixed scale=1.0, just clamp and cast
+    if use_fast_path:
+        return _fast_fp8_quantize(tensor, dtype)
+    
+    # Precise path: compute per-row scales
     fp8_max = torch.finfo(dtype).max
     orig_shape = tensor.shape
     
@@ -282,6 +314,7 @@ def _dynamic_fp8_quantize_blockwise(
     tensor: torch.Tensor,
     block_size: int = 128,
     dtype: torch.dtype = torch.float8_e4m3fn,
+    use_fast_path: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Dynamically quantize activations with 1xK block-wise scaling for scaled_grouped_mm.
@@ -293,10 +326,16 @@ def _dynamic_fp8_quantize_blockwise(
         tensor: Input tensor of shape (..., K)
         block_size: Block size for scaling (default 128)
         dtype: Target FP8 dtype
+        use_fast_path: If True, use fast clamp-based quantization (recommended)
         
     Returns:
-        (qdata, scale) where scale has shape (..., K//block_size)
+        (qdata, scale) where scale has shape (..., K//block_size) or () for fast path
     """
+    # Fast path: fixed scale=1.0, just clamp and cast (much faster)
+    if use_fast_path:
+        return _fast_fp8_quantize(tensor, dtype)
+    
+    # Precise path: compute per-block scales
     fp8_max = torch.finfo(dtype).max
     orig_shape = tensor.shape
     K = orig_shape[-1]
