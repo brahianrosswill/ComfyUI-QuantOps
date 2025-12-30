@@ -2,7 +2,7 @@
 Hybrid BNB 4-bit Operations for NF4/FP4 quantized models.
 
 This module provides custom ops that handle bitsandbytes-compatible 4-bit quantized
-models (NF4/FP4 format) without requiring bitsandbytes as a runtime dependency.
+models (NF4/FP4 format), using native bitsandbytes kernels when available.
 
 State dict format (per quantized weight):
     {prefix}weight: Packed 4-bit indices, shape [numel/2, 1], dtype uint8
@@ -22,6 +22,18 @@ import torch
 import torch.nn.functional as F
 import logging
 from comfy.ops import manual_cast, cast_bias_weight, uncast_bias_weight
+
+# Try to import bitsandbytes for native kernel support
+try:
+    import bitsandbytes as bnb
+    import bitsandbytes.functional as bnb_F
+    from bitsandbytes.functional import QuantState
+    HAS_BNB = True
+    logging.info("bitsandbytes available - using native 4-bit kernels")
+except ImportError:
+    HAS_BNB = False
+    QuantState = None
+    logging.warning("bitsandbytes not available - falling back to PyTorch dequantization (high memory usage)")
 
 
 # NF4 (Normal Float 4-bit) quantization table
@@ -164,9 +176,14 @@ def dequantize_bnb_4bit(
     blocksize: int,
     original_shape: tuple,
     target_dtype: torch.dtype,
+    tile_size: int = 1024 * 1024,  # Process 1M elements per tile
 ) -> torch.Tensor:
     """
-    Dequantize BNB 4-bit packed weights to full precision.
+    Dequantize BNB 4-bit packed weights using tiled approach to prevent OOM.
+    
+    This is the PyTorch FALLBACK when bitsandbytes is not available.
+    When bitsandbytes IS available, we use bnb.matmul_4bit() instead which
+    is more memory efficient (fused kernel, no intermediate tensors).
 
     Args:
         packed: Packed 4-bit indices, shape [numel/2, 1], dtype uint8
@@ -175,51 +192,74 @@ def dequantize_bnb_4bit(
         blocksize: Elements per quantization block
         original_shape: Target output shape
         target_dtype: Target output dtype
+        tile_size: Elements to process per tile (default 1M)
 
     Returns:
         Dequantized weight tensor with original_shape and target_dtype
     """
     device = packed.device
+    
+    # Calculate total size
+    total_elements = 1
+    for s in original_shape:
+        total_elements *= s
+        
+    # Allocate the final output tensor
+    out = torch.empty(total_elements, dtype=target_dtype, device=device)
 
-    # Ensure quant_map is on the right device
+    # Ensure maps are on the calculation device
     quant_map = quant_map.to(device)
     absmax = absmax.to(device)
-
-    # Flatten packed tensor
     packed_flat = packed.flatten()
 
-    # Unpack nibbles: each byte has 2 indices (low 4 bits, high 4 bits)
-    low_indices = (packed_flat & 0x0F).to(torch.long)
-    high_indices = (packed_flat >> 4).to(torch.long)
+    # Align tile_size to blocksize for correct scaling
+    if tile_size % blocksize != 0:
+        tile_size = ((tile_size // blocksize) + 1) * blocksize
 
-    # Interleave to get original order
-    indices = torch.stack([low_indices, high_indices], dim=-1).flatten()
+    out_ptr = 0
+    packed_ptr = 0
+    elements_per_byte = 2
+    
+    # Process in tiles to avoid OOM
+    while out_ptr < total_elements:
+        remaining_elements = total_elements - out_ptr
+        current_tile_elements = min(tile_size, remaining_elements)
+        current_packed_bytes = current_tile_elements // elements_per_byte
+        
+        if current_packed_bytes == 0:
+            break
+            
+        # Unpack indices
+        chunk_packed = packed_flat[packed_ptr : packed_ptr + current_packed_bytes]
+        low_indices = (chunk_packed & 0x0F).to(torch.int32)
+        high_indices = (chunk_packed >> 4).to(torch.int32)
+        chunk_indices = torch.stack([low_indices, high_indices], dim=-1).flatten()
+        
+        # Map to values
+        chunk_values = quant_map[chunk_indices.to(torch.long)].to(target_dtype)
+        
+        # Apply scaling
+        start_block = out_ptr // blocksize
+        end_block = (out_ptr + current_tile_elements) // blocksize
+        chunk_absmax = absmax[start_block:end_block]
+        chunk_absmax_expanded = chunk_absmax.repeat_interleave(blocksize).to(target_dtype)
+        
+        if chunk_absmax_expanded.numel() > current_tile_elements:
+            chunk_absmax_expanded = chunk_absmax_expanded[:current_tile_elements]
+             
+        chunk_dequantized = chunk_values * chunk_absmax_expanded
+        
+        # Write to output
+        out[out_ptr : out_ptr + current_tile_elements] = chunk_dequantized
+        
+        # Advance pointers
+        packed_ptr += current_packed_bytes
+        out_ptr += current_tile_elements
+        
+        # Help GC
+        del chunk_indices, chunk_values, chunk_absmax_expanded, chunk_dequantized
 
-    # Look up values in quant_map
-    values = quant_map[indices]
-
-    # Calculate dimensions
-    n_blocks = absmax.numel()
-    n_elements = values.numel()
-    values_per_block = n_elements // n_blocks
-
-    # Reshape to blocks and scale by absmax
-    if values_per_block * n_blocks <= n_elements:
-        values_blocked = values[:n_blocks * values_per_block].view(n_blocks, values_per_block)
-        dequantized = values_blocked * absmax.view(-1, 1).to(values.dtype)
-    else:
-        # Fallback if dimensions don't match
-        dequantized = values * absmax.repeat_interleave(values_per_block)[:n_elements].to(values.dtype)
-
-    # Flatten and truncate to original size
-    original_numel = 1
-    for s in original_shape:
-        original_numel *= s
-
-    dequantized_flat = dequantized.flatten()[:original_numel]
-
-    # Reshape and cast
-    return dequantized_flat.view(original_shape).to(target_dtype)
+    return out.view(original_shape)
 
 
 class HybridBNB4bitOps(manual_cast):
@@ -248,6 +288,8 @@ class HybridBNB4bitOps(manual_cast):
             self.original_shape = None
             self.original_dtype = torch.bfloat16
             self.quant_type = "nf4"
+            # Native bitsandbytes QuantState for kernel calls
+            self.bnb_quant_state = None
 
         def reset_parameters(self):
             return None
@@ -324,6 +366,21 @@ class HybridBNB4bitOps(manual_cast):
                     requires_grad=False
                 )
 
+                # Create native bitsandbytes QuantState for kernel calls
+                if HAS_BNB and self.absmax is not None:
+                    try:
+                        self.bnb_quant_state = QuantState(
+                            absmax=self.absmax,
+                            shape=torch.Size(self.original_shape) if self.original_shape else None,
+                            dtype=self.original_dtype,
+                            blocksize=self.blocksize,
+                            code=self.quant_map,
+                            quant_type=self.quant_type,
+                        )
+                    except Exception as e:
+                        logging.warning(f"Failed to create QuantState for {weight_key}: {e}")
+                        self.bnb_quant_state = None
+
             else:
                 # Not a BNB 4-bit layer, use standard loading
                 self.is_bnb_4bit = False
@@ -370,10 +427,32 @@ class HybridBNB4bitOps(manual_cast):
             )
 
         def forward_comfy_cast_weights(self, input):
-            """Forward pass with BNB 4-bit dequantization."""
+            """Forward pass with BNB 4-bit - uses native bitsandbytes kernels when available."""
             if self.is_bnb_4bit:
-                # Move quantization data to input device
                 device = input.device
+                
+                # Handle bias
+                bias = self.bias
+                if bias is not None:
+                    bias = bias.to(device=device, dtype=input.dtype)
+
+                # Use native bitsandbytes matmul_4bit if available
+                if HAS_BNB and self.bnb_quant_state is not None:
+                    # Move quant state to device if needed
+                    if self.bnb_quant_state.absmax.device != device:
+                        self.bnb_quant_state.to(device)
+                    if self.packed_weight.device != device:
+                        self.packed_weight = self.packed_weight.to(device)
+                    
+                    # Use native bitsandbytes matmul - fused dequant+matmul, memory efficient
+                    return bnb.matmul_4bit(
+                        input,
+                        self.packed_weight.t(),
+                        bias=bias,
+                        quant_state=self.bnb_quant_state,
+                    )
+                
+                # Fallback to PyTorch dequantization (high memory usage)
                 if self.packed_weight.device != device:
                     self.packed_weight = self.packed_weight.to(device)
                 if self.absmax.device != device:
@@ -381,14 +460,7 @@ class HybridBNB4bitOps(manual_cast):
                 if self.quant_map.device != device:
                     self.quant_map = self.quant_map.to(device)
 
-                # Dequantize weight
                 weight = self._dequantize_weight(input.dtype)
-
-                # Handle bias
-                bias = self.bias
-                if bias is not None:
-                    bias = bias.to(device=device, dtype=input.dtype)
-
                 return F.linear(input, weight, bias)
 
             # Standard manual_cast path for non-BNB layers
@@ -405,6 +477,12 @@ class HybridBNB4bitOps(manual_cast):
         def convert_weight(self, weight, inplace=False, **kwargs):
             """Convert weight for LoRA patching - dequantize BNB 4-bit."""
             if self.is_bnb_4bit:
+                # Use bitsandbytes dequantization if available
+                if HAS_BNB and self.bnb_quant_state is not None:
+                    device = self.packed_weight.device
+                    self.bnb_quant_state.to(device)
+                    return bnb_F.dequantize_4bit(self.packed_weight, self.bnb_quant_state).to(torch.float32)
+                # Fallback to PyTorch dequantization
                 return self._dequantize_weight(torch.float32)
             return weight
 
