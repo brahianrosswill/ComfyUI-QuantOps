@@ -10,6 +10,9 @@ Extended quantization layouts for ComfyUI, enabling loading and inference with m
 | FP8 (row-wise) | `RowWiseFP8Layout` | `float8_e4m3fn_rowwise` | WIP |
 | FP8 (block-wise) | `BlockWiseFP8Layout` | `float8_e4m3fn_blockwise` | WIP |
 | INT8 (block-wise) | `BlockWiseINT8Layout` | `int8` | Supported |
+| **NVFP4 (FP4 E2M1)** | `NVFP4Layout` | `nvfp4` | Supported |
+
+> **Note:** NVFP4 requires Blackwell GPUs (SM ≥10.0) for hardware-accelerated matmul. Non-Blackwell systems use dequantization fallback.
 
 ## Installation
 

@@ -37,7 +37,7 @@ class QuantizedModelLoader:
         return {
             "required": {
                 "ckpt_name": (folder_paths.get_filename_list("checkpoints"),),
-                "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise"],),
+                "quant_format": (["auto", "int8", "nvfp4", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise"],),
                 "kernel_backend": (["pytorch", "triton"],),
             },
             "optional": {
@@ -107,6 +107,17 @@ class QuantizedModelLoader:
                 )
             except ImportError as e:
                 logging.warning(f"HybridFP8Ops not available: {e}")
+        elif quant_format == "nvfp4":
+            # NVFP4 (FP4 E2M1) - use HybridNVFP4Ops
+            try:
+                from ..nvfp4_ops import HybridNVFP4Ops
+
+                model_options = {"custom_operations": HybridNVFP4Ops}
+                logging.info(
+                    "QuantizedModelLoader: Using HybridNVFP4Ops for NVFP4 models"
+                )
+            except ImportError as e:
+                logging.warning(f"HybridNVFP4Ops not available: {e}")
         else:  # auto
             # Try INT8 as fallback for auto mode
             try:
@@ -155,7 +166,7 @@ class QuantizedUNETLoader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise"],),
+                "quant_format": (["auto", "int8", "nvfp4", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise"],),
                 "kernel_backend": (["pytorch", "triton"],),
             },
         }
@@ -210,6 +221,17 @@ class QuantizedUNETLoader:
                 )
             except ImportError as e:
                 logging.warning(f"HybridFP8Ops not available: {e}")
+        elif quant_format == "nvfp4":
+            # NVFP4 (FP4 E2M1) - use HybridNVFP4Ops
+            try:
+                from ..nvfp4_ops import HybridNVFP4Ops
+
+                model_options = {"custom_operations": HybridNVFP4Ops}
+                logging.info(
+                    "QuantizedUNETLoader: Using HybridNVFP4Ops for NVFP4 models"
+                )
+            except ImportError as e:
+                logging.warning(f"HybridNVFP4Ops not available: {e}")
         else:  # auto
             try:
                 from ..int8_ops import HybridINT8Ops

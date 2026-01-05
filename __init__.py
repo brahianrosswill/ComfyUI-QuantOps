@@ -24,10 +24,20 @@ def _register_layouts():
         from .quant_layouts.int8_layout import BlockWiseINT8Layout
         from .quant_layouts.fp8_variants import RowWiseFP8Layout, BlockWiseFP8Layout
 
+        # Try to import NVFP4 layout (may fail if dependencies missing)
+        try:
+            from .quant_layouts.nvfp4_layout import NVFP4Layout
+            _HAS_NVFP4 = True
+        except ImportError as e:
+            logging.debug(f"NVFP4 layout not available: {e}")
+            _HAS_NVFP4 = False
+
         # Register layouts (use setdefault to not override if already present)
         LAYOUTS.setdefault("BlockWiseINT8Layout", BlockWiseINT8Layout)
         LAYOUTS.setdefault("RowWiseFP8Layout", RowWiseFP8Layout)
         LAYOUTS.setdefault("BlockWiseFP8Layout", BlockWiseFP8Layout)
+        if _HAS_NVFP4:
+            LAYOUTS.setdefault("NVFP4Layout", NVFP4Layout)
 
         # Register QUANT_ALGOS
         QUANT_ALGOS.setdefault(
@@ -57,6 +67,16 @@ def _register_layouts():
                 "group_size": 64,
             },
         )
+        if _HAS_NVFP4:
+            QUANT_ALGOS.setdefault(
+                "nvfp4",
+                {
+                    "storage_t": torch.uint8,
+                    "parameters": {"weight_scale", "block_scale"},
+                    "comfy_tensor_layout": "NVFP4Layout",
+                    "group_size": 16,
+                },
+            )
 
         logging.info(f"ComfyUI-QuantOps: Registered layouts: {list(LAYOUTS.keys())}")
 
