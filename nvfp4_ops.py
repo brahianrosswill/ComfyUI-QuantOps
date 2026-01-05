@@ -210,13 +210,17 @@ class HybridNVFP4Ops:
             input_dtype: torch.dtype,
         ) -> torch.Tensor:
             """Pure PyTorch NVFP4 dequantization."""
+            logger.debug(f"PyTorch dequant: weight={weight.shape}, scale={scale}, block_scale={block_scale.shape}")
+            
             # Unpack FP4 data: (M, K//2) -> (M, K)
             data_unpacked = unpack_uint4(weight)
+            logger.debug(f"Unpacked: {data_unpacked.shape}, unique_vals={torch.unique(data_unpacked).tolist()[:10]}")
 
             # Convert unpacked FP4 to float32
             data_f32 = _floatx_unpacked_to_f32(
                 data_unpacked, F4_E2M1_EBITS, F4_E2M1_MBITS
             )
+            logger.debug(f"FP4->F32: min={data_f32.min():.4f}, max={data_f32.max():.4f}")
 
             M, K = data_f32.shape
 
@@ -251,12 +255,24 @@ class HybridNVFP4Ops:
         def forward_comfy_cast_weights(self, input: torch.Tensor) -> torch.Tensor:
             """Forward pass with proper NVFP4 handling."""
             if self.is_quantized and self.quant_format == "nvfp4":
+                logger.debug(
+                    f"NVFP4 forward: weight={self.weight.shape}, "
+                    f"scale={self.scale_weight}, "
+                    f"block_scale={self.block_scale.shape if self.block_scale is not None else None}, "
+                    f"orig_shape={self.orig_shape}"
+                )
                 # Dequantize weight
                 weight = self._dequantize_weight(
                     self.weight,
                     self.scale_weight,
                     self.block_scale,
                     input.dtype,
+                )
+                logger.debug(
+                    f"NVFP4 dequantized: shape={weight.shape}, "
+                    f"dtype={weight.dtype}, "
+                    f"min={weight.min().item():.4f}, max={weight.max().item():.4f}, "
+                    f"mean={weight.mean().item():.4f}"
                 )
                 weight = weight.to(device=input.device)
 
