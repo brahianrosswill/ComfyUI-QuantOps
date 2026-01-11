@@ -308,16 +308,27 @@ class BNB8bitCLIPLoader:
                         "tooltip": "Outlier threshold for LLM.int8(). Values above this are computed in FP16.",
                     },
                 ),
+                "save_quantized": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Save the quantized model as {original}_bnb8bit.safetensors after loading.",
+                    },
+                ),
             },
         }
 
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "load_clip"
     CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load text encoder and quantize to BNB INT8 (LLM.int8()). Auto-detects pre-quantized models. Uses native INT8 tensor cores with outlier handling."
+    OUTPUT_NODE = True  # Needed for save functionality
+    DESCRIPTION = "Load text encoder and quantize to BNB INT8 (LLM.int8()). Auto-detects pre-quantized models. Can save quantized model for faster future loading."
 
-    def load_clip(self, clip_name, type, threshold=6.0):
+    def load_clip(self, clip_name, type, threshold=6.0, save_quantized=False):
         """Load a CLIP/text encoder with BNB INT8 quantization."""
+        import os
+        from safetensors.torch import save_file
+        
         if not _BNB_AVAILABLE:
             raise RuntimeError(
                 "bitsandbytes is required for this node. "
@@ -337,14 +348,35 @@ class BNB8bitCLIPLoader:
         
         if is_prequantized:
             logging.info(f"BNB8bitCLIPLoader: Loading pre-quantized {clip_name}")
+            if save_quantized:
+                logging.info("  (Already quantized, skipping save)")
             return self._load_prequantized(clip_path, clip_type)
         else:
             logging.info(f"BNB8bitCLIPLoader: Loading and quantizing {clip_name}")
             logging.info(f"  Type: {type}, Outlier threshold: {threshold}")
-            return self._load_and_quantize(clip_path, clip_type, threshold)
+            clip = self._load_and_quantize(clip_path, clip_type, threshold, force_quantize=save_quantized)
+            
+            # Save if requested
+            if save_quantized:
+                # Generate output filename
+                base_name = os.path.splitext(clip_name)[0]
+                output_filename = f"{base_name}_bnb8bit.safetensors"
+                output_dir = folder_paths.get_folder_paths("text_encoders")[-1]
+                output_path = os.path.join(output_dir, output_filename)
+                
+                # Extract and save
+                state_dict = self._extract_quantized_state_dict(clip[0])
+                if state_dict:
+                    metadata = {"format": "bitsandbytes_int8", "format_version": "1.0"}
+                    save_file(state_dict, output_path, metadata=metadata)
+                    logging.info(f"BNB8bitCLIPLoader: Saved quantized model to {output_filename}")
+                else:
+                    logging.warning("BNB8bitCLIPLoader: Could not extract quantized weights for saving")
+            
+            return clip
     
-    def _load_and_quantize(self, clip_path, clip_type, threshold):
-        """Load FP16 model and quantize to INT8 on first forward."""
+    def _load_and_quantize(self, clip_path, clip_type, threshold, force_quantize=False):
+        """Load FP16 model and quantize to INT8."""
         # Load state dict (FP16 weights)
         sd = comfy.utils.load_torch_file(clip_path, safe_load=True)
         
@@ -362,9 +394,61 @@ class BNB8bitCLIPLoader:
             embedding_directory=folder_paths.get_folder_paths("embeddings"),
         )
         
-        logging.info(f"BNB8bitCLIPLoader: Successfully loaded (will quantize on first use)")
+        # Force quantization now if saving
+        if force_quantize:
+            logging.info("BNB8bitCLIPLoader: Forcing quantization...")
+            self._force_quantize_all_layers(clip)
+            logging.info("BNB8bitCLIPLoader: Quantization complete")
+        else:
+            logging.info(f"BNB8bitCLIPLoader: Successfully loaded (will quantize on first use)")
         
         return (clip,)
+    
+    def _force_quantize_all_layers(self, clip):
+        """Force quantization of all BNB8bitLinear layers by doing a dummy forward pass."""
+        import torch
+        
+        # Find the model
+        model = None
+        if hasattr(clip, 'cond_stage_model'):
+            model = clip.cond_stage_model
+        elif hasattr(clip, 'patcher') and hasattr(clip.patcher, 'model'):
+            model = clip.patcher.model
+        
+        if model is None:
+            return
+        
+        # Force quantization by triggering _maybe_quantize on each layer
+        device = comfy.model_management.get_torch_device()
+        for name, module in model.named_modules():
+            if isinstance(module, BNB8bitLinear) and not module._quantized:
+                # Create dummy input to trigger quantization
+                dummy_input = torch.zeros(1, module.in_features, device=device, dtype=torch.float16)
+                with torch.no_grad():
+                    module._maybe_quantize(device)
+                    
+    def _extract_quantized_state_dict(self, clip):
+        """Extract quantized state dict from CLIP object."""
+        import json
+        
+        models_to_check = []
+        if hasattr(clip, 'cond_stage_model'):
+            models_to_check.append(clip.cond_stage_model)
+        if hasattr(clip, 'patcher') and hasattr(clip.patcher, 'model'):
+            models_to_check.append(clip.patcher.model)
+        if hasattr(clip, 'model'):
+            models_to_check.append(clip.model)
+        for attr in ['clip_l', 'clip_g', 't5xxl', 'clip_h', 't5_model']:
+            if hasattr(clip, attr):
+                models_to_check.append(getattr(clip, attr))
+        
+        state_dict = {}
+        for model in models_to_check:
+            if model is not None:
+                extracted = extract_bnb8bit_state_dict(model)
+                state_dict.update(extracted)
+        
+        return state_dict
     
     def _load_prequantized(self, clip_path, clip_type):
         """Load pre-quantized INT8 model directly."""
@@ -458,89 +542,11 @@ def extract_bnb8bit_state_dict(model):
     return state_dict
 
 
-class BNB8bitCLIPSaver:
-    """
-    Save a BNB INT8 quantized text encoder to safetensors.
-    
-    Saves the INT8 weights with scale factors for efficient loading.
-    """
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clip": ("CLIP",),
-                "filename": ("STRING", {"default": "text_encoder_bnb8bit"}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("saved_path",)
-    FUNCTION = "save_clip"
-    CATEGORY = "loaders/quantized"
-    OUTPUT_NODE = True
-    DESCRIPTION = "Save a BNB INT8 quantized text encoder to safetensors."
-
-    def save_clip(self, clip, filename):
-        """Save the quantized CLIP model."""
-        import os
-        from safetensors.torch import save_file
-        
-        # Try to find the underlying models in CLIP wrapper
-        # CLIP in ComfyUI has .cond_stage_model (for SD) or multiple clip_l/clip_g/t5xxl models
-        models_to_check = []
-        
-        # Direct model attributes
-        if hasattr(clip, 'cond_stage_model'):
-            models_to_check.append(clip.cond_stage_model)
-        if hasattr(clip, 'patcher') and hasattr(clip.patcher, 'model'):
-            models_to_check.append(clip.patcher.model)
-        if hasattr(clip, 'model'):
-            models_to_check.append(clip.model)
-        
-        # For Flux/SD3 style CLIP with multiple encoders
-        for attr in ['clip_l', 'clip_g', 't5xxl', 'clip_h', 't5_model']:
-            if hasattr(clip, attr):
-                models_to_check.append(getattr(clip, attr))
-            # Also check nested cond_stage_model
-            if hasattr(clip, 'cond_stage_model') and hasattr(clip.cond_stage_model, attr):
-                models_to_check.append(getattr(clip.cond_stage_model, attr))
-        
-        # Extract from all found models
-        state_dict = {}
-        for model in models_to_check:
-            if model is not None:
-                extracted = extract_bnb8bit_state_dict(model)
-                state_dict.update(extracted)
-        
-        if not state_dict:
-            raise ValueError("No BNB 8-bit quantized layers found in model")
-        
-        # Save to text_encoders folder
-        output_dir = folder_paths.get_folder_paths("text_encoders")[-1]
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{filename}.safetensors")
-        
-        # Add metadata
-        metadata = {
-            "format": "bitsandbytes_int8",
-            "format_version": "1.0",
-        }
-        
-        save_file(state_dict, output_path, metadata=metadata)
-        
-        logging.info(f"BNB8bitCLIPSaver: Saved {len(state_dict)} tensors to {output_path}")
-        
-        return (output_path,)
-
-
 # ComfyUI node registration
 NODE_CLASS_MAPPINGS = {
     "BNB8bitCLIPLoader": BNB8bitCLIPLoader,
-    "BNB8bitCLIPSaver": BNB8bitCLIPSaver,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BNB8bitCLIPLoader": "Load Text Encoder (BNB INT8)",
-    "BNB8bitCLIPSaver": "Save Text Encoder (BNB INT8)",
 }
