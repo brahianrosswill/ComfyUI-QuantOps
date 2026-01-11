@@ -440,94 +440,91 @@ class BNB8bitCLIPLoader:
         """
         Extract COMPLETE state dict with quantized linear weights.
         
-        Uses original_sd as base (preserves embeddings, norms, etc.),
-        then replaces linear weights with their INT8 quantized versions.
+        Simple approach: iterate through original_sd, detect 2D weight tensors
+        (linear layers), and replace them with quantized versions from the model.
         """
         import json
         import copy
         
         # Start with a copy of the original state dict
-        state_dict = copy.copy(original_sd)  # Shallow copy is fine, we'll replace values
+        state_dict = {}
         
-        # Find all BNB8bitLinear modules and map their names to original keys
+        # First, collect all BNB8bitLinear modules from the model
+        quantized_modules = {}  # key suffix -> (module, bnb_linear)
+        
         models_to_check = []
         if hasattr(clip, 'cond_stage_model'):
-            models_to_check.append(('', clip.cond_stage_model))
+            models_to_check.append(clip.cond_stage_model)
         if hasattr(clip, 'patcher') and hasattr(clip.patcher, 'model'):
-            models_to_check.append(('', clip.patcher.model))
+            models_to_check.append(clip.patcher.model)
         if hasattr(clip, 'model'):
-            models_to_check.append(('', clip.model))
+            models_to_check.append(clip.model)
         for attr in ['clip_l', 'clip_g', 't5xxl', 'clip_h', 't5_model']:
             if hasattr(clip, attr):
-                models_to_check.append((attr, getattr(clip, attr)))
+                models_to_check.append(getattr(clip, attr))
         
-        quantized_count = 0
-        total_modules = 0
-        bnb_linear_found = 0
-        
-        for model_prefix, model in models_to_check:
+        for model in models_to_check:
             if model is None:
                 continue
-            
-            logging.debug(f"BNB8bitCLIPLoader: Checking model with prefix '{model_prefix}', type: {type(model).__name__}")
-            
-            for name, module in model.named_modules():
-                total_modules += 1
-                is_bnb = isinstance(module, BNB8bitLinear)
-                if is_bnb:
-                    bnb_linear_found += 1
-                    logging.debug(f"  Found BNB8bitLinear: {name}, quantized={module._quantized}, bnb_linear={module._bnb_linear is not None}")
             for name, module in model.named_modules():
                 if isinstance(module, BNB8bitLinear) and module._quantized and module._bnb_linear is not None:
-                    bnb_module = module._bnb_linear
-                    weight = bnb_module.weight
-                    
-                    # Build the weight key suffix to match
-                    # name could be "transformer.model.layers.0.mlp.down_proj"
-                    weight_suffix = f"{name}.weight" if name else "weight"
-                    
-                    # Find matching key in original_sd by checking if it ends with this suffix
-                    matching_key = None
-                    for orig_key in list(state_dict.keys()):
-                        # Check if the original key ends with our weight suffix
-                        if orig_key.endswith(weight_suffix):
-                            matching_key = orig_key
-                            break
-                    
-                    if matching_key is None:
-                        logging.debug(f"  No match found for module: {name}")
-                    
-                    if matching_key:
-                        # Replace with INT8 weight
-                        if hasattr(weight, 'CB') and weight.CB is not None:
-                            state_dict[matching_key] = weight.CB.cpu().to(torch.int8)
-                        elif hasattr(weight, 'data'):
-                            state_dict[matching_key] = weight.data.cpu().to(torch.int8)
-                        
-                        # Add scale factors
-                        if hasattr(weight, 'SCB') and weight.SCB is not None:
-                            state_dict[f"{matching_key}.SCB"] = weight.SCB.cpu().to(torch.float32)
-                        
-                        # Add metadata
-                        metadata = {
-                            "format": "bnb_int8",
-                            "shape": [module.out_features, module.in_features],
-                            "in_features": module.in_features,
-                            "out_features": module.out_features,
-                            "has_fp16_weights": False,
-                        }
-                        json_bytes = json.dumps(metadata).encode('utf-8')
-                        qs_tensor = torch.tensor(list(json_bytes), dtype=torch.uint8)
-                        state_dict[f"{matching_key}.quant_state.bitsandbytes__int8"] = qs_tensor
-                        
-                        # Handle bias
-                        bias_key = matching_key.replace('.weight', '.bias')
-                        if bnb_module.bias is not None:
-                            state_dict[bias_key] = bnb_module.bias.cpu()
-                        
-                        quantized_count += 1
+                    # Store with the weight key suffix
+                    key_suffix = f"{name}.weight" if name else "weight"
+                    quantized_modules[key_suffix] = (module, module._bnb_linear)
         
-        logging.info(f"BNB8bitCLIPLoader: Total modules: {total_modules}, BNB8bitLinear found: {bnb_linear_found}, Quantized for saving: {quantized_count}")
+        logging.info(f"BNB8bitCLIPLoader: Found {len(quantized_modules)} quantized BNB8bitLinear modules")
+        
+        # Now iterate through original state dict
+        quantized_count = 0
+        for key, tensor in original_sd.items():
+            # Check if this is a 2D weight tensor (linear layer)
+            if key.endswith('.weight') and len(tensor.shape) == 2:
+                # Try to find matching quantized module
+                matching_suffix = None
+                for suffix in quantized_modules.keys():
+                    if key.endswith(suffix):
+                        matching_suffix = suffix
+                        break
+                
+                if matching_suffix:
+                    module, bnb_linear = quantized_modules[matching_suffix]
+                    weight = bnb_linear.weight
+                    
+                    # Replace with INT8 weight
+                    if hasattr(weight, 'CB') and weight.CB is not None:
+                        state_dict[key] = weight.CB.cpu().to(torch.int8)
+                    elif hasattr(weight, 'data'):
+                        state_dict[key] = weight.data.cpu().to(torch.int8)
+                    else:
+                        # Fallback - keep original
+                        state_dict[key] = tensor
+                        continue
+                    
+                    # Add scale factors
+                    if hasattr(weight, 'SCB') and weight.SCB is not None:
+                        state_dict[f"{key}.SCB"] = weight.SCB.cpu().to(torch.float32)
+                    
+                    # Add metadata
+                    metadata = {
+                        "format": "bnb_int8",
+                        "shape": list(tensor.shape),
+                        "in_features": module.in_features,
+                        "out_features": module.out_features,
+                        "has_fp16_weights": False,
+                    }
+                    json_bytes = json.dumps(metadata).encode('utf-8')
+                    qs_tensor = torch.tensor(list(json_bytes), dtype=torch.uint8)
+                    state_dict[f"{key}.quant_state.bitsandbytes__int8"] = qs_tensor
+                    
+                    quantized_count += 1
+                else:
+                    # No quantized version found, keep original
+                    state_dict[key] = tensor
+            else:
+                # Not a 2D weight - keep original (embeddings, norms, biases, etc.)
+                state_dict[key] = tensor
+        
+        logging.info(f"BNB8bitCLIPLoader: Saved {quantized_count} quantized linear layers + {len(original_sd) - quantized_count} other tensors")
         return state_dict
     
     def _load_prequantized(self, clip_path, clip_type):
