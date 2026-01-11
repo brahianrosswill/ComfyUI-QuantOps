@@ -29,6 +29,32 @@ except ImportError:
     )
 
 
+def is_bnb8bit_prequantized(file_path: str) -> bool:
+    """
+    Check if a safetensors file contains pre-quantized BNB INT8 weights.
+    
+    Looks for .quant_state.bitsandbytes__int8 keys in the header.
+    """
+    try:
+        from safetensors import safe_open
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            keys = f.keys()
+            return any(k.endswith('.quant_state.bitsandbytes__int8') for k in keys)
+    except Exception:
+        return False
+
+
+def tensor_to_dict(tensor_data):
+    """Decode JSON metadata from uint8 tensor."""
+    import json
+    try:
+        byte_data = bytes(tensor_data.tolist())
+        json_str = byte_data.decode('utf-8')
+        return json.loads(json_str)
+    except Exception:
+        return {}
+
+
 class BNB8bitLinear(torch.nn.Module):
     """
     Wrapper that loads FP16 weights and converts to BNB INT8 on first forward.
@@ -111,6 +137,99 @@ class BNB8bitLinear(torch.nn.Module):
         return self._bnb_linear(x)
 
 
+class BNB8bitPrequantizedLinear(torch.nn.Module):
+    """
+    Linear layer that loads pre-quantized INT8 weights.
+    
+    Expects state dict to contain INT8 weights and SCB scale factors.
+    """
+    
+    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None,
+                 prequantized_sd=None, layer_prefix=""):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.has_bias = bias
+        self._prequantized_sd = prequantized_sd or {}
+        self._layer_prefix = layer_prefix
+        
+        # Placeholder weight - will be replaced during load_state_dict
+        self.weight = torch.nn.Parameter(
+            torch.empty(out_features, in_features, device=device, dtype=torch.int8),
+            requires_grad=False
+        )
+        if bias:
+            self.bias = torch.nn.Parameter(
+                torch.empty(out_features, device=device, dtype=dtype),
+                requires_grad=False
+            )
+        else:
+            self.register_parameter('bias', None)
+        
+        self._bnb_linear = None
+        self._loaded = False
+    
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Custom loading to handle pre-quantized weights."""
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+        
+        # Check if we have SCB scales in the prequantized state dict
+        scb_key = f"{prefix}weight.SCB"
+        full_key = f"{self._layer_prefix}.weight.SCB" if self._layer_prefix else f"{prefix}weight.SCB"
+        
+        if full_key in self._prequantized_sd:
+            self._scb = self._prequantized_sd[full_key]
+        elif scb_key in self._prequantized_sd:
+            self._scb = self._prequantized_sd[scb_key]
+        else:
+            self._scb = None
+    
+    def _maybe_create_bnb_linear(self, device):
+        """Create BNB linear from loaded INT8 weights."""
+        if self._loaded or not _BNB_AVAILABLE:
+            return
+        
+        # Create BNB Linear8bitLt
+        self._bnb_linear = _bnb.nn.Linear8bitLt(
+            self.in_features,
+            self.out_features,
+            bias=self.has_bias,
+            has_fp16_weights=False,
+            threshold=6.0,
+        )
+        
+        # Set the pre-quantized weight
+        with torch.no_grad():
+            weight_int8 = self.weight.data.to(device=device)
+            self._bnb_linear.weight = _bnb.nn.Int8Params(
+                weight_int8,
+                requires_grad=False,
+                has_fp16_weights=False,
+            )
+            # Set the scales if we have them
+            if hasattr(self, '_scb') and self._scb is not None:
+                self._bnb_linear.weight.SCB = self._scb.to(device=device)
+            
+            if self.bias is not None:
+                self._bnb_linear.bias = torch.nn.Parameter(
+                    self.bias.data.to(device=device, dtype=torch.float16),
+                    requires_grad=False
+                )
+        
+        self._loaded = True
+        self.weight = None
+        self.bias = None
+    
+    def forward(self, x):
+        device = x.device
+        
+        if not _BNB_AVAILABLE:
+            raise RuntimeError("bitsandbytes required for pre-quantized INT8 inference")
+        
+        self._maybe_create_bnb_linear(device)
+        return self._bnb_linear(x)
+
+
 def make_bnb8bit_ops():
     """Create ops class that uses BNB 8-bit for Linear layers."""
     
@@ -120,6 +239,20 @@ def make_bnb8bit_ops():
                 super().__init__(*args, device=device, dtype=dtype, **kwargs)
     
     return BNB8bitOps
+
+
+def make_bnb8bit_prequantized_ops(prequantized_sd):
+    """Create ops class that loads pre-quantized INT8 weights."""
+    
+    class BNB8bitPrequantizedOps(comfy.ops.manual_cast):
+        class Linear(BNB8bitPrequantizedLinear):
+            _shared_sd = prequantized_sd
+            
+            def __init__(self, *args, device=None, dtype=None, **kwargs):
+                super().__init__(*args, device=device, dtype=dtype, 
+                                prequantized_sd=self._shared_sd, **kwargs)
+    
+    return BNB8bitPrequantizedOps
 
 
 # CLIPType options matching built-in CLIPLoader
@@ -181,7 +314,7 @@ class BNB8bitCLIPLoader:
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "load_clip"
     CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load text encoder and quantize to BNB INT8 (LLM.int8()). Uses native INT8 tensor cores with outlier handling."
+    DESCRIPTION = "Load text encoder and quantize to BNB INT8 (LLM.int8()). Auto-detects pre-quantized models. Uses native INT8 tensor cores with outlier handling."
 
     def load_clip(self, clip_name, type, threshold=6.0):
         """Load a CLIP/text encoder with BNB INT8 quantization."""
@@ -199,11 +332,21 @@ class BNB8bitCLIPLoader:
             comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION
         )
         
+        # Check if already pre-quantized
+        is_prequantized = is_bnb8bit_prequantized(clip_path)
+        
+        if is_prequantized:
+            logging.info(f"BNB8bitCLIPLoader: Loading pre-quantized {clip_name}")
+            return self._load_prequantized(clip_path, clip_type)
+        else:
+            logging.info(f"BNB8bitCLIPLoader: Loading and quantizing {clip_name}")
+            logging.info(f"  Type: {type}, Outlier threshold: {threshold}")
+            return self._load_and_quantize(clip_path, clip_type, threshold)
+    
+    def _load_and_quantize(self, clip_path, clip_type, threshold):
+        """Load FP16 model and quantize to INT8 on first forward."""
         # Load state dict (FP16 weights)
         sd = comfy.utils.load_torch_file(clip_path, safe_load=True)
-        
-        logging.info(f"BNB8bitCLIPLoader: Loading {clip_name}")
-        logging.info(f"  Type: {type}, Outlier threshold: {threshold}")
         
         # Set up model options with BNB 8-bit ops
         model_options = {
@@ -219,7 +362,43 @@ class BNB8bitCLIPLoader:
             embedding_directory=folder_paths.get_folder_paths("embeddings"),
         )
         
-        logging.info(f"BNB8bitCLIPLoader: Successfully loaded {clip_name}")
+        logging.info(f"BNB8bitCLIPLoader: Successfully loaded (will quantize on first use)")
+        
+        return (clip,)
+    
+    def _load_prequantized(self, clip_path, clip_type):
+        """Load pre-quantized INT8 model directly."""
+        from safetensors import safe_open
+        
+        # Load state dict
+        sd = {}
+        with safe_open(clip_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                sd[key] = f.get_tensor(key)
+        
+        # Create ops that can handle pre-quantized weights
+        model_options = {
+            "initial_device": comfy.model_management.text_encoder_offload_device(),
+            "custom_operations": make_bnb8bit_prequantized_ops(sd),
+        }
+        
+        # Build a clean state dict for ComfyUI (without quant metadata keys)
+        clean_sd = {}
+        for key, value in sd.items():
+            # Skip quant_state and SCB keys - they're handled by the ops
+            if '.quant_state.' in key or key.endswith('.SCB'):
+                continue
+            clean_sd[key] = value
+        
+        # Load text encoder using ComfyUI's API
+        clip = comfy.sd.load_text_encoder_state_dicts(
+            state_dicts=[clean_sd],
+            clip_type=clip_type,
+            model_options=model_options,
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+        )
+        
+        logging.info(f"BNB8bitCLIPLoader: Successfully loaded pre-quantized model")
         
         return (clip,)
 
@@ -239,7 +418,11 @@ def extract_bnb8bit_state_dict(model):
     state_dict = {}
     
     for name, module in model.named_modules():
-        if isinstance(module, BNB8bitLinear) and module._quantized and module._bnb_linear is not None:
+        # Check for both quantize-on-load and pre-quantized linear types
+        is_bnb8bit_linear = isinstance(module, BNB8bitLinear) and module._quantized and module._bnb_linear is not None
+        is_prequant_linear = isinstance(module, BNB8bitPrequantizedLinear) and module._loaded and module._bnb_linear is not None
+        
+        if is_bnb8bit_linear or is_prequant_linear:
             bnb_module = module._bnb_linear
             weight = bnb_module.weight
             
@@ -303,21 +486,32 @@ class BNB8bitCLIPSaver:
         import os
         from safetensors.torch import save_file
         
-        # Get the underlying model
-        # CLIP wrapper has .cond_stage_model or similar
-        model = None
+        # Try to find the underlying models in CLIP wrapper
+        # CLIP in ComfyUI has .cond_stage_model (for SD) or multiple clip_l/clip_g/t5xxl models
+        models_to_check = []
+        
+        # Direct model attributes
         if hasattr(clip, 'cond_stage_model'):
-            model = clip.cond_stage_model
-        elif hasattr(clip, 'patcher') and hasattr(clip.patcher, 'model'):
-            model = clip.patcher.model
-        elif hasattr(clip, 'model'):
-            model = clip.model
+            models_to_check.append(clip.cond_stage_model)
+        if hasattr(clip, 'patcher') and hasattr(clip.patcher, 'model'):
+            models_to_check.append(clip.patcher.model)
+        if hasattr(clip, 'model'):
+            models_to_check.append(clip.model)
         
-        if model is None:
-            raise ValueError("Could not find model inside CLIP object")
+        # For Flux/SD3 style CLIP with multiple encoders
+        for attr in ['clip_l', 'clip_g', 't5xxl', 'clip_h', 't5_model']:
+            if hasattr(clip, attr):
+                models_to_check.append(getattr(clip, attr))
+            # Also check nested cond_stage_model
+            if hasattr(clip, 'cond_stage_model') and hasattr(clip.cond_stage_model, attr):
+                models_to_check.append(getattr(clip.cond_stage_model, attr))
         
-        # Extract quantized state dict
-        state_dict = extract_bnb8bit_state_dict(model)
+        # Extract from all found models
+        state_dict = {}
+        for model in models_to_check:
+            if model is not None:
+                extracted = extract_bnb8bit_state_dict(model)
+                state_dict.update(extracted)
         
         if not state_dict:
             raise ValueError("No BNB 8-bit quantized layers found in model")
