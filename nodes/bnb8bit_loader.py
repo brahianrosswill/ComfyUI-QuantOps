@@ -462,32 +462,40 @@ class BNB8bitCLIPLoader:
                 models_to_check.append((attr, getattr(clip, attr)))
         
         quantized_count = 0
+        total_modules = 0
+        bnb_linear_found = 0
+        
         for model_prefix, model in models_to_check:
             if model is None:
                 continue
             
+            logging.debug(f"BNB8bitCLIPLoader: Checking model with prefix '{model_prefix}', type: {type(model).__name__}")
+            
+            for name, module in model.named_modules():
+                total_modules += 1
+                is_bnb = isinstance(module, BNB8bitLinear)
+                if is_bnb:
+                    bnb_linear_found += 1
+                    logging.debug(f"  Found BNB8bitLinear: {name}, quantized={module._quantized}, bnb_linear={module._bnb_linear is not None}")
             for name, module in model.named_modules():
                 if isinstance(module, BNB8bitLinear) and module._quantized and module._bnb_linear is not None:
                     bnb_module = module._bnb_linear
                     weight = bnb_module.weight
                     
-                    # Build the full key path
-                    # The name is relative to model, but state dict uses full path
-                    weight_key = f"{name}.weight"
+                    # Build the weight key suffix to match
+                    # name could be "transformer.model.layers.0.mlp.down_proj"
+                    weight_suffix = f"{name}.weight" if name else "weight"
                     
-                    # Find matching key in original_sd
+                    # Find matching key in original_sd by checking if it ends with this suffix
                     matching_key = None
                     for orig_key in list(state_dict.keys()):
-                        if orig_key.endswith(weight_key) or orig_key == weight_key:
+                        # Check if the original key ends with our weight suffix
+                        if orig_key.endswith(weight_suffix):
                             matching_key = orig_key
                             break
                     
                     if matching_key is None:
-                        # Try with model prefix
-                        for orig_key in list(state_dict.keys()):
-                            if weight_key in orig_key:
-                                matching_key = orig_key
-                                break
+                        logging.debug(f"  No match found for module: {name}")
                     
                     if matching_key:
                         # Replace with INT8 weight
@@ -519,7 +527,7 @@ class BNB8bitCLIPLoader:
                         
                         quantized_count += 1
         
-        logging.info(f"BNB8bitCLIPLoader: Quantized {quantized_count} linear layers for saving")
+        logging.info(f"BNB8bitCLIPLoader: Total modules: {total_modules}, BNB8bitLinear found: {bnb_linear_found}, Quantized for saving: {quantized_count}")
         return state_dict
     
     def _load_prequantized(self, clip_path, clip_type):
