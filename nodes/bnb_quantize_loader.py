@@ -203,6 +203,26 @@ class BNB4bitQuantizeLoader:
         logging.info(f"  Quant type: {quant_type}, blocksize: {blocksize}")
         logging.info(f"  Exclude patterns: {exclude_list}")
 
+        # Estimate model size and prepare memory by unloading cached models
+        try:
+            import os
+            model_size_bytes = os.path.getsize(unet_path)
+            model_size_gb = model_size_bytes / (1024**3)
+            
+            # Request memory from ComfyUI (unloads cached models)
+            # We need ~1.5x the layer size for: load + CUDA copy + quantized output
+            # But since we process layer-by-layer, we just need headroom for the largest layer
+            # Estimate largest layer as ~0.5% of model size for safety
+            headroom_gb = max(0.5, model_size_gb * 0.02)
+            headroom_bytes = int(headroom_gb * 1024**3)
+            
+            logging.info(f"  Model size: {model_size_gb:.2f}GB, requesting {headroom_gb:.2f}GB VRAM headroom")
+            model_management.free_memory(headroom_bytes, model_management.get_torch_device())
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logging.warning(f"  Could not prepare memory: {e}")
+
         # Open model with memory-efficient loader
         quantized_sd = {}
         all_keys = []
@@ -276,12 +296,11 @@ class BNB4bitQuantizeLoader:
                         
                         quantized_count += 1
                         
-                        if (i + 1) % 50 == 0:
+                        # Progress and periodic cleanup (every 20 layers)
+                        if (i + 1) % 20 == 0:
                             logging.info(f"  [{i+1}/{total_keys}] Quantized {quantized_count} layers...")
-                        
-                        # Force memory cleanup (both GPU and CPU)
-                        torch.cuda.empty_cache()
-                        gc.collect()
+                            torch.cuda.empty_cache()
+                            gc.collect()
                         
                     except Exception as e:
                         logging.warning(f"  Failed to quantize {clean_key}: {e}, keeping original")
@@ -290,13 +309,11 @@ class BNB4bitQuantizeLoader:
                             tensor = f.get_tensor(key)
                         quantized_sd[clean_key] = tensor.cpu().clone()
                         del tensor
-                        gc.collect()
                         excluded_count += 1
                 else:
                     # Non-quantizable tensor (bias, norm, etc.) - store on CPU
                     quantized_sd[clean_key] = tensor.cpu().clone()
                     del tensor
-                    gc.collect()
 
         logging.info(f"BNB4bitQuantizeLoader: Quantized {quantized_count} layers, excluded {excluded_count}")
 

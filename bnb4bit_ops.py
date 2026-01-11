@@ -36,17 +36,21 @@ _QuantState = None
 try:
     import bitsandbytes.functional as bnb_F
     from bitsandbytes.functional import QuantState
-    from bitsandbytes.autograd import matmul_4bit as bnb_matmul_4bit_fn
+    # matmul_4bit location changed in bitsandbytes 0.48+
+    try:
+        from bitsandbytes.autograd._functions import matmul_4bit as bnb_matmul_4bit_fn
+    except ImportError:
+        from bitsandbytes import matmul_4bit as bnb_matmul_4bit_fn
     
     _BNB_AVAILABLE = True
     _bnb_functional = bnb_F
     _bnb_matmul_4bit = bnb_matmul_4bit_fn
     _QuantState = QuantState
     logging.info("ComfyUI-QuantOps: bitsandbytes available, using native 4-bit kernels")
-except ImportError:
+except Exception as e:
     logging.warning(
-        "ComfyUI-QuantOps: bitsandbytes not available, using pure-PyTorch fallback. "
-        "Install bitsandbytes for better performance: pip install bitsandbytes"
+        f"ComfyUI-QuantOps: bitsandbytes import failed: {e}. "
+        "Using pure-PyTorch fallback. Install bitsandbytes for better performance: pip install bitsandbytes"
     )
 
 
@@ -406,12 +410,16 @@ class HybridBNB4bitOps(manual_cast):
             )
 
         def forward_comfy_cast_weights(self, input):
-            """Forward pass with BNB 4-bit support."""
+            """Forward pass with BNB 4-bit support and CPU offloading."""
             if self.is_bnb_4bit:
                 device = input.device
                 
+                # Track original device for offloading back
+                original_device = self.packed_weight.device
+                should_offload = original_device != device
+                
                 # Move packed weight to device
-                if self.packed_weight.device != device:
+                if should_offload:
                     self.packed_weight = self.packed_weight.to(device)
 
                 # Native BNB path
@@ -425,6 +433,12 @@ class HybridBNB4bitOps(manual_cast):
                         quant_state=self.quant_state,
                         bias=self.bias.to(device=device, dtype=input.dtype) if self.bias is not None else None,
                     )
+                    
+                    # Offload back to original device (CPU) after forward
+                    if should_offload:
+                        self.packed_weight = self.packed_weight.to(original_device)
+                        self.quant_state.to(original_device)
+                    
                     return output
                 
                 # Fallback: PyTorch dequantization
@@ -438,7 +452,15 @@ class HybridBNB4bitOps(manual_cast):
                 if bias is not None:
                     bias = bias.to(device=device, dtype=input.dtype)
 
-                return F.linear(input, weight, bias)
+                output = F.linear(input, weight, bias)
+                
+                # Offload back
+                if should_offload:
+                    self.packed_weight = self.packed_weight.to(original_device)
+                    self.absmax = self.absmax.to(original_device)
+                    self.quant_map = self.quant_map.to(original_device)
+                
+                return output
 
             # Standard manual_cast path for non-BNB layers
             weight, bias, offload_stream = cast_bias_weight(self, input, offloadable=True)
