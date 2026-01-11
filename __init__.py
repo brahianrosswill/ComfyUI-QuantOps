@@ -266,6 +266,17 @@ try:
 except ImportError as e:
     logging.warning(f"ComfyUI-QuantOps: BNB4bitQuantizeLoader not available: {e}")
 
+# Import and merge BNB 8-bit text encoder loader
+try:
+    from .nodes.bnb8bit_loader import (
+        NODE_CLASS_MAPPINGS as BNB8BIT_NODES,
+        NODE_DISPLAY_NAME_MAPPINGS as BNB8BIT_NAMES,
+    )
+    NODE_CLASS_MAPPINGS.update(BNB8BIT_NODES)
+    NODE_DISPLAY_NAME_MAPPINGS.update(BNB8BIT_NAMES)
+except ImportError as e:
+    logging.warning(f"ComfyUI-QuantOps: BNB8bitCLIPLoader not available: {e}")
+
 __all__ = [
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
