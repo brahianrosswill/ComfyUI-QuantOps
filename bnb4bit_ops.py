@@ -1,8 +1,8 @@
 """
-Hybrid BNB 4-bit Operations for NF4/FP4 quantized models.
+Native BNB 4-bit Operations for NF4/FP4 quantized models.
 
 This module provides custom ops that handle bitsandbytes-compatible 4-bit quantized
-models (NF4/FP4 format) without requiring bitsandbytes as a runtime dependency.
+models using native bitsandbytes kernels when available, with a pure-PyTorch fallback.
 
 State dict format (per quantized weight):
     {prefix}weight: Packed 4-bit indices, shape [numel/2, 1], dtype uint8
@@ -18,15 +18,48 @@ The JSON metadata contains:
 """
 
 import json
+import logging
 import torch
 import torch.nn.functional as F
-import logging
 from comfy.ops import manual_cast, cast_bias_weight, uncast_bias_weight
 
 
+# =============================================================================
+# BNB Availability Check
+# =============================================================================
+
+_BNB_AVAILABLE = False
+_bnb_functional = None
+_bnb_matmul_4bit = None
+_QuantState = None
+
+try:
+    import bitsandbytes.functional as bnb_F
+    from bitsandbytes.functional import QuantState
+    from bitsandbytes.autograd import matmul_4bit as bnb_matmul_4bit_fn
+    
+    _BNB_AVAILABLE = True
+    _bnb_functional = bnb_F
+    _bnb_matmul_4bit = bnb_matmul_4bit_fn
+    _QuantState = QuantState
+    logging.info("ComfyUI-QuantOps: bitsandbytes available, using native 4-bit kernels")
+except ImportError:
+    logging.warning(
+        "ComfyUI-QuantOps: bitsandbytes not available, using pure-PyTorch fallback. "
+        "Install bitsandbytes for better performance: pip install bitsandbytes"
+    )
+
+
+def is_bnb_available() -> bool:
+    """Check if bitsandbytes is available for native 4-bit operations."""
+    return _BNB_AVAILABLE
+
+
+# =============================================================================
+# Fallback: Pure-PyTorch Codebooks (when BNB not available)
+# =============================================================================
+
 # NF4 (Normal Float 4-bit) quantization table
-# These are 16 values derived from the normal distribution, normalized to [-1, 1].
-# Source: QLoRA paper (https://arxiv.org/abs/2305.14314)
 NF4_QUANT_MAP = torch.tensor([
     -1.0,
     -0.6961928009986877,
@@ -47,7 +80,6 @@ NF4_QUANT_MAP = torch.tensor([
 ], dtype=torch.float32)
 
 # FP4 (Floating Point 4-bit) quantization table
-# Normalized E2M1 floating point representation.
 FP4_QUANT_MAP = torch.tensor([
     0.0,
     0.00520833,
@@ -67,6 +99,10 @@ FP4_QUANT_MAP = torch.tensor([
     -1.0,
 ], dtype=torch.float32)
 
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
 def tensor_to_dict(tensor_data: torch.Tensor) -> dict:
     """Convert a uint8 tensor containing JSON bytes back to a dictionary."""
@@ -94,16 +130,8 @@ def preprocess_bnb_state_dict(state_dict: dict) -> dict:
     architecture. BNB 4-bit packed weights have shape [N*K/2, 1] instead of
     original [N, K], causing detection to fail.
 
-    For Flux2 and similar models, detection code has hardcoded defaults
-    (e.g., hidden_size=3072, in_channels=16) that are used when weight keys
-    are absent. This function simply OMITS packed weight keys from the
-    detection state dict, allowing those defaults to be used.
-
-    Args:
-        state_dict: Original state dict with packed BNB 4-bit weights
-
-    Returns:
-        New state dict with packed weight keys omitted (auxiliary keys kept)
+    This function omits packed weight keys from the detection state dict,
+    allowing hardcoded defaults to be used.
     """
     new_sd = {}
     packed_weight_keys = set()
@@ -111,18 +139,14 @@ def preprocess_bnb_state_dict(state_dict: dict) -> dict:
     # First pass: identify all BNB 4-bit packed weight keys
     for key in state_dict.keys():
         if '.quant_state.bitsandbytes__nf4' in key or '.quant_state.bitsandbytes__fp4' in key:
-            # Extract weight key: "layer.weight.quant_state..." -> "layer.weight"
             weight_key = key.rsplit('.quant_state.', 1)[0]
             packed_weight_keys.add(weight_key)
 
     # Second pass: copy all keys EXCEPT the packed weight keys themselves
-    # (Keep auxiliary keys like .absmax, .quant_map, .quant_state for loading)
     for key, value in state_dict.items():
         if key in packed_weight_keys:
-            # Skip packed weight - detection will use defaults
             logging.debug(f"Omitting packed weight {key} for detection (defaults will be used)")
             continue
-        # Keep everything else
         new_sd[key] = value
 
     logging.info(f"BNB preprocess: omitted {len(packed_weight_keys)} packed weight keys for detection")
@@ -132,18 +156,7 @@ def preprocess_bnb_state_dict(state_dict: dict) -> dict:
 def get_original_shape(state_dict: dict, weight_key: str) -> tuple:
     """
     Get original shape of a BNB 4-bit quantized weight from its quant_state.
-
-    BNB stores original shape in the quant_state JSON metadata:
-    - key.quant_state.bitsandbytes__nf4 or __fp4 contains {"shape": [N, K], ...}
-
-    Args:
-        state_dict: State dict with BNB 4-bit weights
-        weight_key: Key of the weight (without .quant_state suffix)
-
-    Returns:
-        Tuple of original shape, or None if not found
     """
-    # Try NF4 first, then FP4
     for suffix in ['.quant_state.bitsandbytes__nf4', '.quant_state.bitsandbytes__fp4']:
         qs_key = weight_key + suffix
         if qs_key in state_dict:
@@ -157,7 +170,43 @@ def get_original_shape(state_dict: dict, weight_key: str) -> tuple:
     return None
 
 
-def dequantize_bnb_4bit(
+def _build_qs_dict_for_layer(state_dict: dict, prefix: str, quant_type: str) -> dict:
+    """
+    Build a QuantState-compatible dict from state dict keys for a layer.
+    
+    Args:
+        state_dict: Full model state dict
+        prefix: Layer prefix (e.g., "model.layers.0.attn.qkv.")
+        quant_type: "nf4" or "fp4"
+    
+    Returns:
+        Dict suitable for QuantState.from_dict()
+    """
+    qs_dict = {}
+    
+    # Get the packed quant_state tensor (contains JSON metadata)
+    qs_key = f"{prefix}weight.quant_state.bitsandbytes__{quant_type}"
+    if qs_key in state_dict:
+        qs_dict[f"quant_state.bitsandbytes__{quant_type}"] = state_dict[qs_key]
+    
+    # Get absmax
+    absmax_key = f"{prefix}weight.absmax"
+    if absmax_key in state_dict:
+        qs_dict["absmax"] = state_dict[absmax_key]
+    
+    # Get quant_map
+    qmap_key = f"{prefix}weight.quant_map"
+    if qmap_key in state_dict:
+        qs_dict["quant_map"] = state_dict[qmap_key]
+    
+    return qs_dict
+
+
+# =============================================================================
+# Fallback: Pure-PyTorch Dequantization
+# =============================================================================
+
+def dequantize_bnb_4bit_pytorch(
     packed: torch.Tensor,
     absmax: torch.Tensor,
     quant_map: torch.Tensor,
@@ -166,82 +215,66 @@ def dequantize_bnb_4bit(
     target_dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    Dequantize BNB 4-bit packed weights to full precision.
-
-    Args:
-        packed: Packed 4-bit indices, shape [numel/2, 1], dtype uint8
-        absmax: Per-block absolute maximum, shape [num_blocks], dtype float32
-        quant_map: 16-element codebook, dtype float32
-        blocksize: Elements per quantization block
-        original_shape: Target output shape
-        target_dtype: Target output dtype
-
-    Returns:
-        Dequantized weight tensor with original_shape and target_dtype
+    Dequantize BNB 4-bit packed weights using pure PyTorch (fallback).
     """
     device = packed.device
-
-    # Ensure quant_map is on the right device
     quant_map = quant_map.to(device)
     absmax = absmax.to(device)
 
-    # Flatten packed tensor
     packed_flat = packed.flatten()
 
-    # Unpack nibbles: each byte has 2 indices (low 4 bits, high 4 bits)
+    # Unpack nibbles
     low_indices = (packed_flat & 0x0F).to(torch.long)
     high_indices = (packed_flat >> 4).to(torch.long)
-
-    # Interleave to get original order
     indices = torch.stack([low_indices, high_indices], dim=-1).flatten()
 
     # Look up values in quant_map
     values = quant_map[indices]
 
-    # Calculate dimensions
+    # Scale by absmax
     n_blocks = absmax.numel()
     n_elements = values.numel()
     values_per_block = n_elements // n_blocks
 
-    # Reshape to blocks and scale by absmax
     if values_per_block * n_blocks <= n_elements:
         values_blocked = values[:n_blocks * values_per_block].view(n_blocks, values_per_block)
         dequantized = values_blocked * absmax.view(-1, 1).to(values.dtype)
     else:
-        # Fallback if dimensions don't match
         dequantized = values * absmax.repeat_interleave(values_per_block)[:n_elements].to(values.dtype)
 
-    # Flatten and truncate to original size
     original_numel = 1
     for s in original_shape:
         original_numel *= s
 
     dequantized_flat = dequantized.flatten()[:original_numel]
-
-    # Reshape and cast
     return dequantized_flat.view(original_shape).to(target_dtype)
 
+
+# =============================================================================
+# Main Ops Class
+# =============================================================================
 
 class HybridBNB4bitOps(manual_cast):
     """
     Hybrid BNB 4-bit operations class for NF4/FP4 quantized models.
 
-    Handles:
-    - Loading from bitsandbytes-format state dicts
-    - Dequantization during forward pass
-    - Falls back to standard path for non-quantized layers
+    Uses native bitsandbytes kernels when available, falls back to pure-PyTorch.
+    
+    LoRA patching is NOT supported via dynamic ops. Use a dedicated LoRA merge
+    node that does layer-by-layer dequant -> merge -> requant.
     """
 
     class Linear(manual_cast.Linear):
         def __init__(self, in_features, out_features, *args, **kwargs):
-            # Force CPU device to reduce memory during init
-            # BNB layers will have weights replaced in _load_from_state_dict
-            # Non-BNB layers will keep these CPU weights (moved to GPU in forward)
             kwargs['device'] = 'cpu'
             super().__init__(in_features, out_features, *args, **kwargs)
-            # 4-bit quantization state
+            
+            # BNB 4-bit state
             self.is_bnb_4bit = False
+            self.quant_state = None  # Native BNB QuantState object
             self.packed_weight = None
+            
+            # Fallback state (when BNB not available)
             self.absmax = None
             self.quant_map = None
             self.blocksize = 64
@@ -252,24 +285,17 @@ class HybridBNB4bitOps(manual_cast):
         def reset_parameters(self):
             return None
 
-
-
-
         def _load_from_state_dict(
             self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         ):
             """
             Custom state dict loading that handles BNB 4-bit format.
-
-            Expected keys:
-                {prefix}weight: Packed uint8 tensor
-                {prefix}weight.absmax: Per-block scales
-                {prefix}weight.quant_map: 16-element codebook
-                {prefix}weight.quant_state.bitsandbytes__nf4 (or __fp4): JSON metadata
+            
+            Reconstructs native BNB QuantState when bitsandbytes is available.
             """
             weight_key = prefix + 'weight'
 
-            # Check for BNB 4-bit format by looking for quant_state key
+            # Check for BNB 4-bit format
             quant_state_key_nf4 = prefix + 'weight.quant_state.bitsandbytes__nf4'
             quant_state_key_fp4 = prefix + 'weight.quant_state.bitsandbytes__fp4'
 
@@ -281,22 +307,8 @@ class HybridBNB4bitOps(manual_cast):
                 if quant_state_tensor is not None:
                     self.quant_type = "fp4"
 
-            # If we found a quant_state, this is a BNB 4-bit layer
             if quant_state_tensor is not None:
                 self.is_bnb_4bit = True
-
-                # Parse quant_state JSON
-                try:
-                    quant_state = tensor_to_dict(quant_state_tensor)
-                    self.blocksize = quant_state.get('blocksize', 64)
-                    self.original_shape = tuple(quant_state.get('shape', []))
-                    dtype_str = quant_state.get('dtype', 'bfloat16')
-                    self.original_dtype = getattr(torch, dtype_str, torch.bfloat16)
-                    logging.debug(f"BNB 4-bit layer {weight_key}: {self.quant_type}, shape={self.original_shape}, blocksize={self.blocksize}")
-                except Exception as e:
-                    logging.warning(f"Failed to parse quant_state for {weight_key}: {e}")
-                    self.blocksize = 64
-                    self.original_shape = None
 
                 # Load packed weight
                 self.packed_weight = state_dict.pop(weight_key, None)
@@ -305,20 +317,49 @@ class HybridBNB4bitOps(manual_cast):
 
                 # Load absmax
                 absmax_key = prefix + 'weight.absmax'
-                self.absmax = state_dict.pop(absmax_key, None)
-                if self.absmax is not None:
-                    self.absmax = self.absmax.to(torch.float32)
+                absmax_tensor = state_dict.pop(absmax_key, None)
+                if absmax_tensor is not None:
+                    absmax_tensor = absmax_tensor.to(torch.float32)
 
-                # Load quant_map (or use default)
+                # Load quant_map
                 quant_map_key = prefix + 'weight.quant_map'
-                loaded_quant_map = state_dict.pop(quant_map_key, None)
-                if loaded_quant_map is not None:
-                    self.quant_map = loaded_quant_map.to(torch.float32)
-                else:
-                    self.quant_map = get_quant_map(self.quant_type, torch.device('cpu'))
+                quant_map_tensor = state_dict.pop(quant_map_key, None)
+                if quant_map_tensor is not None:
+                    quant_map_tensor = quant_map_tensor.to(torch.float32)
+
+                # Try to build native BNB QuantState
+                if _BNB_AVAILABLE and _QuantState is not None:
+                    try:
+                        # Build qs_dict for QuantState.from_dict()
+                        qs_dict = {
+                            f"quant_state.bitsandbytes__{self.quant_type}": quant_state_tensor,
+                            "absmax": absmax_tensor,
+                            "quant_map": quant_map_tensor,
+                        }
+                        self.quant_state = _QuantState.from_dict(qs_dict, device=torch.device('cpu'))
+                        logging.debug(f"BNB 4-bit layer {weight_key}: using native QuantState")
+                    except Exception as e:
+                        logging.warning(f"Failed to create native QuantState for {weight_key}: {e}")
+                        self.quant_state = None
+
+                # Fallback: parse metadata manually
+                if self.quant_state is None:
+                    try:
+                        quant_state_meta = tensor_to_dict(quant_state_tensor)
+                        self.blocksize = quant_state_meta.get('blocksize', 64)
+                        self.original_shape = tuple(quant_state_meta.get('shape', []))
+                        dtype_str = quant_state_meta.get('dtype', 'bfloat16')
+                        self.original_dtype = getattr(torch, dtype_str, torch.bfloat16)
+                        logging.debug(f"BNB 4-bit layer {weight_key}: using PyTorch fallback")
+                    except Exception as e:
+                        logging.warning(f"Failed to parse quant_state for {weight_key}: {e}")
+                        self.blocksize = 64
+                        self.original_shape = None
+
+                    self.absmax = absmax_tensor
+                    self.quant_map = quant_map_tensor if quant_map_tensor is not None else get_quant_map(self.quant_type, torch.device('cpu'))
 
                 # Set dummy weight to satisfy module structure
-                # Actual dequantization happens in forward
                 self.weight = torch.nn.Parameter(
                     torch.empty(1, dtype=torch.float32),
                     requires_grad=False
@@ -341,26 +382,21 @@ class HybridBNB4bitOps(manual_cast):
             else:
                 self.bias = None
 
-        def _dequantize_weight(self, input_dtype: torch.dtype) -> torch.Tensor:
-            """Dequantize 4-bit weight to the specified dtype."""
-            if not self.is_bnb_4bit:
-                return self.weight.to(input_dtype)
-
+        def _dequantize_weight_pytorch(self, input_dtype: torch.dtype) -> torch.Tensor:
+            """Fallback: dequantize using pure PyTorch."""
             if self.packed_weight is None or self.absmax is None:
                 raise RuntimeError("BNB 4-bit layer missing packed_weight or absmax")
 
-            # Infer original shape if not stored
+            # Infer shape if not stored
             if self.original_shape is None or len(self.original_shape) == 0:
-                # Try to infer from absmax and blocksize
                 n_blocks = self.absmax.numel()
-                n_elements = self.packed_weight.numel() * 2  # 2 values per byte
-                # Assume 2D weight
+                n_elements = self.packed_weight.numel() * 2
                 out_features = n_blocks * self.blocksize // (n_elements // n_blocks)
                 in_features = n_elements // out_features if out_features > 0 else n_elements
                 self.original_shape = (out_features, in_features)
                 logging.warning(f"Inferred shape {self.original_shape} for BNB 4-bit layer")
 
-            return dequantize_bnb_4bit(
+            return dequantize_bnb_4bit_pytorch(
                 self.packed_weight,
                 self.absmax,
                 self.quant_map,
@@ -370,21 +406,34 @@ class HybridBNB4bitOps(manual_cast):
             )
 
         def forward_comfy_cast_weights(self, input):
-            """Forward pass with BNB 4-bit dequantization."""
+            """Forward pass with BNB 4-bit support."""
             if self.is_bnb_4bit:
-                # Move quantization data to input device
                 device = input.device
+                
+                # Move packed weight to device
                 if self.packed_weight.device != device:
                     self.packed_weight = self.packed_weight.to(device)
+
+                # Native BNB path
+                if self.quant_state is not None and _BNB_AVAILABLE:
+                    self.quant_state.to(device)
+                    
+                    # Use native matmul_4bit
+                    output = _bnb_matmul_4bit(
+                        input,
+                        self.packed_weight.t(),
+                        quant_state=self.quant_state,
+                        bias=self.bias.to(device=device, dtype=input.dtype) if self.bias is not None else None,
+                    )
+                    return output
+                
+                # Fallback: PyTorch dequantization
                 if self.absmax.device != device:
                     self.absmax = self.absmax.to(device)
                 if self.quant_map.device != device:
                     self.quant_map = self.quant_map.to(device)
 
-                # Dequantize weight
-                weight = self._dequantize_weight(input.dtype)
-
-                # Handle bias
+                weight = self._dequantize_weight_pytorch(input.dtype)
                 bias = self.bias
                 if bias is not None:
                     bias = bias.to(device=device, dtype=input.dtype)
@@ -403,15 +452,29 @@ class HybridBNB4bitOps(manual_cast):
             return super().forward(*args, **kwargs)
 
         def convert_weight(self, weight, inplace=False, **kwargs):
-            """Convert weight for LoRA patching - dequantize BNB 4-bit."""
+            """
+            Convert weight for LoRA patching.
+            
+            Returns None for BNB 4-bit layers to signal that dynamic LoRA patching
+            is not supported. Use a dedicated LoRA merge node instead.
+            """
             if self.is_bnb_4bit:
-                return self._dequantize_weight(torch.float32)
+                # Signal that LoRA patching is not supported
+                logging.warning(
+                    "LoRA patching not supported for BNB 4-bit layers. "
+                    "Use a dedicated LoRA merge node for layer-by-layer patching."
+                )
+                return None
             return weight
 
         def set_weight(self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs):
             """Set weight after LoRA patching."""
             if return_weight:
                 return weight
+            
+            if weight is None:
+                # LoRA patching was skipped for BNB layer
+                return
 
             if inplace_update and not self.is_bnb_4bit:
                 self.weight.data.copy_(weight)
@@ -420,6 +483,7 @@ class HybridBNB4bitOps(manual_cast):
 
             # After patching, no longer in 4-bit mode
             self.is_bnb_4bit = False
+            self.quant_state = None
             self.packed_weight = None
             self.absmax = None
 

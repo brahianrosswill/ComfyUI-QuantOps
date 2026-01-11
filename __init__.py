@@ -255,8 +255,20 @@ _register_layouts()
 # Import nodes for ComfyUI discovery
 from .nodes.loader_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
+# Import and merge quantize loader nodes
+try:
+    from .nodes.bnb_quantize_loader import (
+        NODE_CLASS_MAPPINGS as BNB_QUANT_NODES,
+        NODE_DISPLAY_NAME_MAPPINGS as BNB_QUANT_NAMES,
+    )
+    NODE_CLASS_MAPPINGS.update(BNB_QUANT_NODES)
+    NODE_DISPLAY_NAME_MAPPINGS.update(BNB_QUANT_NAMES)
+except ImportError as e:
+    logging.warning(f"ComfyUI-QuantOps: BNB4bitQuantizeLoader not available: {e}")
+
 __all__ = [
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
     "is_ck_triton_available",
 ]
+
