@@ -354,7 +354,13 @@ class BNB8bitCLIPLoader:
         else:
             logging.info(f"BNB8bitCLIPLoader: Loading and quantizing {clip_name}")
             logging.info(f"  Type: {type}, Outlier threshold: {threshold}")
-            clip = self._load_and_quantize(clip_path, clip_type, threshold, force_quantize=save_quantized)
+            
+            # Load original state dict (we'll need it for saving)
+            original_sd = comfy.utils.load_torch_file(clip_path, safe_load=True)
+            
+            clip = self._load_and_quantize(clip_path, clip_type, threshold, 
+                                          force_quantize=save_quantized, 
+                                          original_sd=original_sd if save_quantized else None)
             
             # Save if requested
             if save_quantized:
@@ -364,8 +370,8 @@ class BNB8bitCLIPLoader:
                 output_dir = folder_paths.get_folder_paths("text_encoders")[-1]
                 output_path = os.path.join(output_dir, output_filename)
                 
-                # Extract and save
-                state_dict = self._extract_quantized_state_dict(clip[0])
+                # Extract and save - use original_sd as base
+                state_dict = self._extract_quantized_state_dict(clip[0], original_sd)
                 if state_dict:
                     metadata = {"format": "bitsandbytes_int8", "format_version": "1.0"}
                     save_file(state_dict, output_path, metadata=metadata)
@@ -375,10 +381,13 @@ class BNB8bitCLIPLoader:
             
             return clip
     
-    def _load_and_quantize(self, clip_path, clip_type, threshold, force_quantize=False):
+    def _load_and_quantize(self, clip_path, clip_type, threshold, force_quantize=False, original_sd=None):
         """Load FP16 model and quantize to INT8."""
-        # Load state dict (FP16 weights)
-        sd = comfy.utils.load_torch_file(clip_path, safe_load=True)
+        # Use provided state dict or load from file
+        if original_sd is not None:
+            sd = original_sd
+        else:
+            sd = comfy.utils.load_torch_file(clip_path, safe_load=True)
         
         # Set up model options with BNB 8-bit ops
         model_options = {
@@ -427,15 +436,20 @@ class BNB8bitCLIPLoader:
                 with torch.no_grad():
                     module._maybe_quantize(device)
                     
-    def _extract_quantized_state_dict(self, clip):
+    def _extract_quantized_state_dict(self, clip, original_sd):
         """
-        Extract COMPLETE state dict from CLIP object with quantized weights.
+        Extract COMPLETE state dict with quantized linear weights.
         
-        Saves all layers (embeddings, norms, etc.) plus replaces linear weights
-        with their INT8 quantized versions.
+        Uses original_sd as base (preserves embeddings, norms, etc.),
+        then replaces linear weights with their INT8 quantized versions.
         """
         import json
+        import copy
         
+        # Start with a copy of the original state dict
+        state_dict = copy.copy(original_sd)  # Shallow copy is fine, we'll replace values
+        
+        # Find all BNB8bitLinear modules and map their names to original keys
         models_to_check = []
         if hasattr(clip, 'cond_stage_model'):
             models_to_check.append(('', clip.cond_stage_model))
@@ -447,62 +461,65 @@ class BNB8bitCLIPLoader:
             if hasattr(clip, attr):
                 models_to_check.append((attr, getattr(clip, attr)))
         
-        state_dict = {}
-        for prefix, model in models_to_check:
+        quantized_count = 0
+        for model_prefix, model in models_to_check:
             if model is None:
                 continue
-                
-            # Get the full state dict from the model
-            try:
-                full_sd = model.state_dict()
-            except Exception:
-                continue
             
-            # Now process each key - for BNB8bitLinear, extract quantized weights
             for name, module in model.named_modules():
                 if isinstance(module, BNB8bitLinear) and module._quantized and module._bnb_linear is not None:
-                    # This is a quantized linear - extract INT8 weights
                     bnb_module = module._bnb_linear
                     weight = bnb_module.weight
                     
+                    # Build the full key path
+                    # The name is relative to model, but state dict uses full path
                     weight_key = f"{name}.weight"
                     
-                    # Remove the placeholder from full_sd if present
-                    if weight_key in full_sd:
-                        del full_sd[weight_key]
+                    # Find matching key in original_sd
+                    matching_key = None
+                    for orig_key in list(state_dict.keys()):
+                        if orig_key.endswith(weight_key) or orig_key == weight_key:
+                            matching_key = orig_key
+                            break
                     
-                    # Add INT8 weight
-                    if hasattr(weight, 'CB') and weight.CB is not None:
-                        full_sd[weight_key] = weight.CB.cpu().to(torch.int8)
-                    elif hasattr(weight, 'data'):
-                        full_sd[weight_key] = weight.data.cpu().to(torch.int8)
+                    if matching_key is None:
+                        # Try with model prefix
+                        for orig_key in list(state_dict.keys()):
+                            if weight_key in orig_key:
+                                matching_key = orig_key
+                                break
                     
-                    # Add scale factors
-                    if hasattr(weight, 'SCB') and weight.SCB is not None:
-                        full_sd[f"{weight_key}.SCB"] = weight.SCB.cpu().to(torch.float32)
-                    
-                    # Add metadata
-                    metadata = {
-                        "format": "bnb_int8",
-                        "shape": [module.out_features, module.in_features],
-                        "in_features": module.in_features,
-                        "out_features": module.out_features,
-                        "has_fp16_weights": False,
-                    }
-                    json_bytes = json.dumps(metadata).encode('utf-8')
-                    qs_tensor = torch.tensor(list(json_bytes), dtype=torch.uint8)
-                    full_sd[f"{weight_key}.quant_state.bitsandbytes__int8"] = qs_tensor
-                    
-                    # Handle bias
-                    bias_key = f"{name}.bias"
-                    if bnb_module.bias is not None:
-                        full_sd[bias_key] = bnb_module.bias.cpu()
-            
-            # Add prefix if needed and merge into main state_dict
-            for key, value in full_sd.items():
-                full_key = f"{prefix}.{key}" if prefix else key
-                state_dict[full_key] = value
+                    if matching_key:
+                        # Replace with INT8 weight
+                        if hasattr(weight, 'CB') and weight.CB is not None:
+                            state_dict[matching_key] = weight.CB.cpu().to(torch.int8)
+                        elif hasattr(weight, 'data'):
+                            state_dict[matching_key] = weight.data.cpu().to(torch.int8)
+                        
+                        # Add scale factors
+                        if hasattr(weight, 'SCB') and weight.SCB is not None:
+                            state_dict[f"{matching_key}.SCB"] = weight.SCB.cpu().to(torch.float32)
+                        
+                        # Add metadata
+                        metadata = {
+                            "format": "bnb_int8",
+                            "shape": [module.out_features, module.in_features],
+                            "in_features": module.in_features,
+                            "out_features": module.out_features,
+                            "has_fp16_weights": False,
+                        }
+                        json_bytes = json.dumps(metadata).encode('utf-8')
+                        qs_tensor = torch.tensor(list(json_bytes), dtype=torch.uint8)
+                        state_dict[f"{matching_key}.quant_state.bitsandbytes__int8"] = qs_tensor
+                        
+                        # Handle bias
+                        bias_key = matching_key.replace('.weight', '.bias')
+                        if bnb_module.bias is not None:
+                            state_dict[bias_key] = bnb_module.bias.cpu()
+                        
+                        quantized_count += 1
         
+        logging.info(f"BNB8bitCLIPLoader: Quantized {quantized_count} linear layers for saving")
         return state_dict
     
     def _load_prequantized(self, clip_path, clip_type):
