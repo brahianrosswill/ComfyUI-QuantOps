@@ -5,6 +5,7 @@ Loads a regular (non-quantized) model from safetensors and quantizes to
 BNB NF4/FP4 format layer-by-layer to avoid OOM.
 """
 
+import gc
 import logging
 import re
 import torch
@@ -228,7 +229,9 @@ class BNB4bitQuantizeLoader:
                     # Check exclusion filter
                     if should_exclude(clean_key, exclude_list):
                         logging.debug(f"  [{i+1}/{total_keys}] EXCLUDE: {clean_key}")
-                        quantized_sd[clean_key] = tensor
+                        # Store on CPU explicitly, then free original
+                        quantized_sd[clean_key] = tensor.cpu().clone()
+                        del tensor
                         excluded_count += 1
                         continue
                     
@@ -236,6 +239,8 @@ class BNB4bitQuantizeLoader:
                     try:
                         # Move to CUDA for quantization
                         weight_cuda = tensor.to('cuda', dtype=torch.bfloat16)
+                        # Free original tensor immediately to save RAM
+                        del tensor
                         
                         # Quantize
                         packed, quant_state = _bnb_functional.quantize_4bit(
@@ -245,17 +250,22 @@ class BNB4bitQuantizeLoader:
                             compress_statistics=False,
                         )
                         
-                        # Store in BNB format
+                        # Free GPU tensor immediately after quantization
+                        del weight_cuda
+                        
+                        # Store in BNB format (move to CPU)
                         quantized_sd[clean_key] = packed.cpu()
                         quantized_sd[f"{clean_key}.absmax"] = quant_state.absmax.cpu()
                         quantized_sd[f"{clean_key}.quant_map"] = quant_state.code.cpu()
                         
+                        # Free quant_state GPU tensors
+                        del packed, quant_state
+                        
                         # Store metadata as JSON tensor
                         import json
-                        from ..bnb4bit_ops import NF4_QUANT_MAP, FP4_QUANT_MAP
                         
                         metadata = {
-                            "dtype": str(tensor.dtype).replace("torch.", ""),
+                            "dtype": "bfloat16",  # We converted to bf16 for quantization
                             "shape": list(shape),
                             "blocksize": blocksize,
                             "quant_type": quant_type,
@@ -269,17 +279,24 @@ class BNB4bitQuantizeLoader:
                         if (i + 1) % 50 == 0:
                             logging.info(f"  [{i+1}/{total_keys}] Quantized {quantized_count} layers...")
                         
-                        # Free GPU memory
-                        del weight_cuda, packed, quant_state
+                        # Force memory cleanup (both GPU and CPU)
                         torch.cuda.empty_cache()
+                        gc.collect()
                         
                     except Exception as e:
                         logging.warning(f"  Failed to quantize {clean_key}: {e}, keeping original")
-                        quantized_sd[clean_key] = tensor
+                        # tensor might already be deleted, reload if needed
+                        if 'tensor' not in dir():
+                            tensor = f.get_tensor(key)
+                        quantized_sd[clean_key] = tensor.cpu().clone()
+                        del tensor
+                        gc.collect()
                         excluded_count += 1
                 else:
-                    # Non-quantizable tensor (bias, norm, etc.)
-                    quantized_sd[clean_key] = tensor
+                    # Non-quantizable tensor (bias, norm, etc.) - store on CPU
+                    quantized_sd[clean_key] = tensor.cpu().clone()
+                    del tensor
+                    gc.collect()
 
         logging.info(f"BNB4bitQuantizeLoader: Quantized {quantized_count} layers, excluded {excluded_count}")
 

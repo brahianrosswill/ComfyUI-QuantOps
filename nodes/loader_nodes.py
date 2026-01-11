@@ -455,18 +455,20 @@ class BNB4bitUNETLoader:
             logging.error(f"Failed to import HybridBNB4bitOps: {e}")
             raise
 
-        # Get model path and load state dict
+        # Get model path and load state dict using memory-efficient loader
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
-        sd = comfy.utils.load_torch_file(unet_path)
-
-        # Strip prefix if present
-        new_sd = {}
-        for k, v in sd.items():
-            if k.startswith("model.diffusion_model."):
-                new_sd[k[22:]] = v
-            else:
-                new_sd[k] = v
-        sd = new_sd
+        
+        from ..utils.safetensors_loader import MemoryEfficientSafeOpen
+        
+        sd = {}
+        with MemoryEfficientSafeOpen(unet_path, mmap_mode=True) as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+                # Strip prefix if present
+                clean_key = key
+                if key.startswith("model.diffusion_model."):
+                    clean_key = key[22:]
+                sd[clean_key] = tensor
 
         # Detect or use override
         if model_type_override == "auto":
