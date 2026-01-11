@@ -454,25 +454,34 @@ class BNB8bitCLIPLoader:
         
         models_to_check = []
         if hasattr(clip, 'cond_stage_model'):
-            models_to_check.append(clip.cond_stage_model)
+            models_to_check.append(('cond_stage_model', clip.cond_stage_model))
         if hasattr(clip, 'patcher') and hasattr(clip.patcher, 'model'):
-            models_to_check.append(clip.patcher.model)
+            models_to_check.append(('patcher.model', clip.patcher.model))
         if hasattr(clip, 'model'):
-            models_to_check.append(clip.model)
+            models_to_check.append(('model', clip.model))
         for attr in ['clip_l', 'clip_g', 't5xxl', 'clip_h', 't5_model']:
             if hasattr(clip, attr):
-                models_to_check.append(getattr(clip, attr))
+                models_to_check.append((attr, getattr(clip, attr)))
         
-        for model in models_to_check:
+        logging.info(f"BNB8bitCLIPLoader: Searching {len(models_to_check)} model locations: {[n for n, m in models_to_check]}")
+        
+        total_modules_checked = 0
+        bnb_linear_count = 0
+        for model_name, model in models_to_check:
             if model is None:
                 continue
             for name, module in model.named_modules():
-                if isinstance(module, BNB8bitLinear) and module._quantized and module._bnb_linear is not None:
-                    # Store with the weight key suffix
-                    key_suffix = f"{name}.weight" if name else "weight"
-                    quantized_modules[key_suffix] = (module, module._bnb_linear)
+                total_modules_checked += 1
+                if isinstance(module, BNB8bitLinear):
+                    bnb_linear_count += 1
+                    if module._quantized and module._bnb_linear is not None:
+                        # Store with the weight key suffix
+                        key_suffix = f"{name}.weight" if name else "weight"
+                        quantized_modules[key_suffix] = (module, module._bnb_linear)
+                    else:
+                        logging.warning(f"  BNB8bitLinear '{name}' not quantized: _quantized={module._quantized}, _bnb_linear={module._bnb_linear is not None}")
         
-        logging.info(f"BNB8bitCLIPLoader: Found {len(quantized_modules)} quantized BNB8bitLinear modules")
+        logging.info(f"BNB8bitCLIPLoader: Checked {total_modules_checked} modules, found {bnb_linear_count} BNB8bitLinear, {len(quantized_modules)} ready for save")
         
         # Now iterate through original state dict
         quantized_count = 0
@@ -523,6 +532,14 @@ class BNB8bitCLIPLoader:
             else:
                 # Not a 2D weight - keep original (embeddings, norms, biases, etc.)
                 state_dict[key] = tensor
+        
+        # CRITICAL: If we found no quantized layers, something is wrong - don't silently save BF16
+        if quantized_count == 0:
+            raise RuntimeError(
+                f"BNB8bitCLIPLoader: FAILED to find any quantized layers! "
+                f"Found {len(quantized_modules)} BNB8bitLinear modules but matched 0 to state dict keys. "
+                f"This is a bug - please report."
+            )
         
         logging.info(f"BNB8bitCLIPLoader: Saved {quantized_count} quantized linear layers + {len(original_sd) - quantized_count} other tensors")
         return state_dict
