@@ -224,11 +224,129 @@ class BNB8bitCLIPLoader:
         return (clip,)
 
 
+def extract_bnb8bit_state_dict(model):
+    """
+    Extract state dict from a model with BNB 8-bit quantized layers.
+    
+    Returns a state dict with:
+    - layer.weight: INT8 quantized weights (CB matrix)
+    - layer.weight.SCB: FP32 scale factors
+    - layer.weight.quant_state.bitsandbytes__int8: metadata JSON
+    - layer.bias: FP16 bias (if present)
+    """
+    import json
+    
+    state_dict = {}
+    
+    for name, module in model.named_modules():
+        if isinstance(module, BNB8bitLinear) and module._quantized and module._bnb_linear is not None:
+            bnb_module = module._bnb_linear
+            weight = bnb_module.weight
+            
+            # Get the layer name prefix
+            prefix = name + "." if name else ""
+            
+            # Extract INT8 weights (CB matrix)
+            if hasattr(weight, 'CB') and weight.CB is not None:
+                state_dict[f"{prefix}weight"] = weight.CB.cpu().to(torch.int8)
+            elif hasattr(weight, 'data'):
+                state_dict[f"{prefix}weight"] = weight.data.cpu().to(torch.int8)
+            
+            # Extract scale factors (SCB)
+            if hasattr(weight, 'SCB') and weight.SCB is not None:
+                state_dict[f"{prefix}weight.SCB"] = weight.SCB.cpu().to(torch.float32)
+            
+            # Store metadata
+            metadata = {
+                "format": "bnb_int8",
+                "shape": list(bnb_module.weight.shape) if hasattr(bnb_module.weight, 'shape') else [module.out_features, module.in_features],
+                "in_features": module.in_features,
+                "out_features": module.out_features,
+                "has_fp16_weights": False,
+            }
+            json_bytes = json.dumps(metadata).encode('utf-8')
+            qs_tensor = torch.tensor(list(json_bytes), dtype=torch.uint8)
+            state_dict[f"{prefix}weight.quant_state.bitsandbytes__int8"] = qs_tensor
+            
+            # Bias
+            if bnb_module.bias is not None:
+                state_dict[f"{prefix}bias"] = bnb_module.bias.cpu()
+    
+    return state_dict
+
+
+class BNB8bitCLIPSaver:
+    """
+    Save a BNB INT8 quantized text encoder to safetensors.
+    
+    Saves the INT8 weights with scale factors for efficient loading.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "filename": ("STRING", {"default": "text_encoder_bnb8bit"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("saved_path",)
+    FUNCTION = "save_clip"
+    CATEGORY = "loaders/quantized"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Save a BNB INT8 quantized text encoder to safetensors."
+
+    def save_clip(self, clip, filename):
+        """Save the quantized CLIP model."""
+        import os
+        from safetensors.torch import save_file
+        
+        # Get the underlying model
+        # CLIP wrapper has .cond_stage_model or similar
+        model = None
+        if hasattr(clip, 'cond_stage_model'):
+            model = clip.cond_stage_model
+        elif hasattr(clip, 'patcher') and hasattr(clip.patcher, 'model'):
+            model = clip.patcher.model
+        elif hasattr(clip, 'model'):
+            model = clip.model
+        
+        if model is None:
+            raise ValueError("Could not find model inside CLIP object")
+        
+        # Extract quantized state dict
+        state_dict = extract_bnb8bit_state_dict(model)
+        
+        if not state_dict:
+            raise ValueError("No BNB 8-bit quantized layers found in model")
+        
+        # Save to text_encoders folder
+        output_dir = folder_paths.get_folder_paths("text_encoders")[-1]
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{filename}.safetensors")
+        
+        # Add metadata
+        metadata = {
+            "format": "bitsandbytes_int8",
+            "format_version": "1.0",
+        }
+        
+        save_file(state_dict, output_path, metadata=metadata)
+        
+        logging.info(f"BNB8bitCLIPSaver: Saved {len(state_dict)} tensors to {output_path}")
+        
+        return (output_path,)
+
+
 # ComfyUI node registration
 NODE_CLASS_MAPPINGS = {
     "BNB8bitCLIPLoader": BNB8bitCLIPLoader,
+    "BNB8bitCLIPSaver": BNB8bitCLIPSaver,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BNB8bitCLIPLoader": "Load Text Encoder (BNB INT8)",
+    "BNB8bitCLIPSaver": "Save Text Encoder (BNB INT8)",
 }
