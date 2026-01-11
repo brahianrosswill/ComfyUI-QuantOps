@@ -454,26 +454,21 @@ class BNB8bitCLIPLoader:
                 )
             
             # Now iterate through original_sd and build save_dict
-            debug_count = 0
             for key, tensor in original_sd.items():
                 if key.endswith('.weight') and len(tensor.shape) == 2:
-                    # This is a linear weight - find matching BNB8bitLinear
+                    # State dict key: "model.layers.0.self_attn.q_proj.weight"
+                    # Module name: "qwen3_4b.transformer.model.layers.0.self_attn.q_proj"
+                    # The MODULE name ends with the KEY (without .weight)
                     key_without_weight = key[:-7]  # Remove ".weight"
                     matching_module = None
                     matching_name = None
                     
                     for mod_name, mod in bnb_modules.items():
-                        if key_without_weight.endswith(mod_name) or key_without_weight == mod_name:
+                        # Module name ends with key, not other way around!
+                        if mod_name.endswith(key_without_weight):
                             matching_module = mod
                             matching_name = mod_name
                             break
-                    
-                    # Debug first few
-                    if debug_count < 3:
-                        logging.info(f"  Key: {key_without_weight}")
-                        logging.info(f"  First module: {list(bnb_modules.keys())[0] if bnb_modules else 'none'}")
-                        logging.info(f"  Match: {matching_name}")
-                        debug_count += 1
                     
                     if matching_module:
                         # Force quantize this module
