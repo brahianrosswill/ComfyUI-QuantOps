@@ -371,6 +371,15 @@ class UnifiedHybridOps(manual_cast):
                         f"UnifiedHybridOps: [DTYPE CHANGED] Layer {getattr(self, '_layer_name', 'unknown')} "
                         f"was loaded as {self._orig_dtype} but is now {weight.dtype}"
                     )
+            
+            # EXPLICIT HIGH-PRECISION PATH: Skip all quantization dispatch for non-quantized layers
+            if not self.is_quantized and self.layout_type is None:
+                # This is a high-precision layer - use standard linear directly
+                bias = self.bias
+                if bias is not None:
+                    bias = bias.to(device=input.device, dtype=input_dtype)
+                weight_cast = weight.to(device=input.device, dtype=input_dtype)
+                return torch.nn.functional.linear(input, weight_cast, bias)
 
             # Handle QuantizedTensor (triggers dispatch to layout handlers)
             if isinstance(weight, QuantizedTensor):
@@ -402,7 +411,7 @@ class UnifiedHybridOps(manual_cast):
                 elif weight.dtype == torch.int8:
                     return self._forward_int8_fallback(input, weight)
 
-            # Standard manual_cast path for non-quantized weights
+            # Standard manual_cast path for anything else
             weight, bias, offload_stream = cast_bias_weight(self, input, offloadable=True)
             out = torch.nn.functional.linear(input, weight, bias)
             uncast_bias_weight(self, weight, bias, offload_stream)
