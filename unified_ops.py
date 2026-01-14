@@ -148,10 +148,22 @@ class UnifiedHybridOps(manual_cast):
                 else:
                     self.is_quantized = False
                     self.scale_weight = None
+                    self.layout_type = None  # Explicitly None for high-precision
+                    self._layer_name = prefix  # Store for forward tracking
+                    self._orig_dtype = weight_tensor.dtype  # Store original dtype
                     self.weight = torch.nn.Parameter(weight_tensor, requires_grad=False)
-                    logging.debug(
-                        f"UnifiedHybridOps: High-precision layer {prefix}, dtype={weight_tensor.dtype}"
-                    )
+                    
+                    # Only log 2D tensors (Linear weights)
+                    if weight_tensor.ndim == 2:
+                        logging.info(
+                            f"UnifiedHybridOps: [HIGH-PRECISION] Loaded {prefix} "
+                            f"dtype={weight_tensor.dtype}, shape={tuple(weight_tensor.shape)}, "
+                            f"is_quantized=False, layout_type=None"
+                        )
+                    else:
+                        logging.debug(
+                            f"UnifiedHybridOps: High-precision layer {prefix}, dtype={weight_tensor.dtype}"
+                        )
             else:
                 missing_keys.append(weight_key)
 
@@ -343,6 +355,22 @@ class UnifiedHybridOps(manual_cast):
                 weight = weight.data
 
             input_dtype = input.dtype
+            
+            # DEBUG: Check if a high-precision layer was unexpectedly quantized
+            if hasattr(self, '_orig_dtype') and self._orig_dtype in [torch.bfloat16, torch.float16, torch.float32]:
+                # This layer was loaded as high-precision
+                actual_dtype = weight.dtype if not isinstance(weight, QuantizedTensor) else "QuantizedTensor"
+                if isinstance(weight, QuantizedTensor):
+                    logging.warning(
+                        f"UnifiedHybridOps: [UNEXPECTED QUANT] Layer {getattr(self, '_layer_name', 'unknown')} "
+                        f"was loaded as {self._orig_dtype} but is now QuantizedTensor! "
+                        f"layout={weight._layout}"
+                    )
+                elif weight.dtype != self._orig_dtype:
+                    logging.warning(
+                        f"UnifiedHybridOps: [DTYPE CHANGED] Layer {getattr(self, '_layer_name', 'unknown')} "
+                        f"was loaded as {self._orig_dtype} but is now {weight.dtype}"
+                    )
 
             # Handle QuantizedTensor (triggers dispatch to layout handlers)
             if isinstance(weight, QuantizedTensor):
