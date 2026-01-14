@@ -26,10 +26,14 @@ class QuantizedModelLoader:
     Supports models quantized by convert_to_quant (with or without --comfy_quant flag).
     Automatically handles legacy scale_weight -> weight_scale conversion.
 
-    FP8 Modes:
-    - float8_e4m3fn: Standard tensor-scaled FP8 (uses ComfyUI built-in handling)
-    - float8_e4m3fn_blockwise: Block-wise scaled FP8 (uses HybridFP8Ops)
-    - float8_e4m3fn_rowwise: Row-wise scaled FP8 (uses HybridFP8Ops)
+    Modes:
+    - auto: Unified per-layer detection from .comfy_quant metadata (NVFP4/MXFP8/FP8/INT8/BF16)
+    - int8: INT8 blockwise/lodewise quantization
+    - float8_e4m3fn: Standard tensor-scaled FP8 (ComfyUI built-in)
+    - float8_e4m3fn_blockwise: Block-wise scaled FP8
+    - float8_e4m3fn_rowwise: Row-wise scaled FP8
+    - mxfp8: Microscaling FP8 with E8M0 block scales
+    - nvfp4: NVIDIA FP4 with FP8 block scales
     """
 
     @classmethod
@@ -54,7 +58,7 @@ class QuantizedModelLoader:
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
     FUNCTION = "load_checkpoint"
     CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load checkpoints with custom quantization support. float8_e4m3fn (tensor-scaled) uses ComfyUI built-in. INT8/FP8 blockwise/rowwise use custom layouts."
+    DESCRIPTION = "Load checkpoints with multi-format quantization support. Use 'auto' for mixed-format models with per-layer detection."
 
 
     def load_checkpoint(
@@ -107,21 +111,38 @@ class QuantizedModelLoader:
                 )
             except ImportError as e:
                 logging.warning(f"HybridFP8Ops not available: {e}")
-        else:  # auto
-            # Try INT8 as fallback for auto mode
+        else:  # auto - unified ops handles all formats per-layer
             try:
-                from ..int8_ops import HybridINT8Ops
+                from ..unified_ops import UnifiedHybridOps
 
-                model_options = {"custom_operations": HybridINT8Ops}
-                logging.info("QuantizedModelLoader: Auto-selected HybridINT8Ops")
+                model_options = {"custom_operations": UnifiedHybridOps}
+                logging.info("QuantizedModelLoader: Using UnifiedHybridOps (multi-format per-layer)")
             except ImportError as e:
-                logging.warning(f"No quantized ops available: {e}")
+                logging.warning(f"UnifiedHybridOps not available, falling back: {e}")
+                try:
+                    from ..fp8_ops import HybridFP8Ops
+                    model_options = {"custom_operations": HybridFP8Ops}
+                except ImportError:
+                    pass
 
         # Load state dict with guaranteed float32 scales using our loader
         try:
             from ..utils.safetensors_loader import load_fp8_state_dict
             sd, metadata = load_fp8_state_dict(ckpt_path, force_scale_float32=True)
             logging.info("QuantizedModelLoader: Loaded state dict with float32 scales")
+            
+            # Pass global quantization metadata to UnifiedHybridOps if available
+            if quant_format == "auto" and metadata:
+                quant_metadata = metadata.get("_quantization_metadata", None)
+                if quant_metadata:
+                    try:
+                        import json
+                        from ..unified_ops import UnifiedHybridOps
+                        UnifiedHybridOps.set_global_metadata(json.loads(quant_metadata))
+                        logging.info("QuantizedModelLoader: Set global quantization metadata from header")
+                    except Exception as e:
+                        logging.debug(f"Failed to parse global quantization metadata: {e}")
+            
             # Use ComfyUI's guess config with our pre-loaded state dict
             out = comfy.sd.load_state_dict_guess_config(
                 sd,
@@ -157,12 +178,16 @@ class QuantizedUNETLoader:
     """
     Load UNET/diffusion models with custom quantization layouts.
 
-    Handles legacy scale_weight format automatically.
+    Handles legacy scale_weight format and mixed-quantization models automatically.
 
-    FP8 Modes:
-    - float8_e4m3fn: Standard tensor-scaled FP8 (uses ComfyUI built-in handling)
-    - float8_e4m3fn_blockwise: Block-wise scaled FP8 (uses HybridFP8Ops)
-    - float8_e4m3fn_rowwise: Row-wise scaled FP8 (uses HybridFP8Ops)
+    Modes:
+    - auto: Unified per-layer detection from .comfy_quant metadata (NVFP4/MXFP8/FP8/INT8/BF16)
+    - int8: INT8 blockwise/lodewise quantization
+    - float8_e4m3fn: Standard tensor-scaled FP8 (ComfyUI built-in)
+    - float8_e4m3fn_blockwise: Block-wise scaled FP8
+    - float8_e4m3fn_rowwise: Row-wise scaled FP8
+    - mxfp8: Microscaling FP8 with E8M0 block scales
+    - nvfp4: NVIDIA FP4 with FP8 block scales
     """
 
     @classmethod
@@ -178,7 +203,7 @@ class QuantizedUNETLoader:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
     CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load diffusion models with custom quantization support. float8_e4m3fn (tensor-scaled) uses ComfyUI built-in. INT8/FP8 blockwise/rowwise use custom layouts."
+    DESCRIPTION = "Load diffusion models with multi-format quantization support. Use 'auto' for mixed-format models with per-layer detection."
 
     def load_unet(self, unet_name, quant_format, kernel_backend):
         """Load a UNET model with the specified settings."""
@@ -225,20 +250,37 @@ class QuantizedUNETLoader:
                 )
             except ImportError as e:
                 logging.warning(f"HybridFP8Ops not available: {e}")
-        else:  # auto
+        else:  # auto - unified ops handles all formats per-layer
             try:
-                from ..int8_ops import HybridINT8Ops
+                from ..unified_ops import UnifiedHybridOps
 
-                model_options = {"custom_operations": HybridINT8Ops}
-                logging.info("QuantizedUNETLoader: Auto-selected HybridINT8Ops")
+                model_options = {"custom_operations": UnifiedHybridOps}
+                logging.info("QuantizedUNETLoader: Using UnifiedHybridOps (multi-format per-layer)")
             except ImportError as e:
-                logging.warning(f"No quantized ops available: {e}")
+                logging.warning(f"UnifiedHybridOps not available, falling back: {e}")
+                try:
+                    from ..fp8_ops import HybridFP8Ops
+                    model_options = {"custom_operations": HybridFP8Ops}
+                except ImportError:
+                    pass
 
         # Load state dict with guaranteed float32 scales using our loader
         try:
             from ..utils.safetensors_loader import load_fp8_state_dict
             sd, metadata = load_fp8_state_dict(unet_path, force_scale_float32=True)
             logging.info("QuantizedUNETLoader: Loaded state dict with float32 scales")
+            
+            # Pass global quantization metadata to UnifiedHybridOps if available
+            if quant_format == "auto" and metadata:
+                quant_metadata = metadata.get("_quantization_metadata", None)
+                if quant_metadata:
+                    try:
+                        import json
+                        from ..unified_ops import UnifiedHybridOps
+                        UnifiedHybridOps.set_global_metadata(json.loads(quant_metadata))
+                        logging.info("QuantizedUNETLoader: Set global quantization metadata from header")
+                    except Exception as e:
+                        logging.debug(f"Failed to parse global quantization metadata: {e}")
         except Exception as e:
             # Fallback to standard loading
             logging.warning(f"QuantizedUNETLoader: Custom loader failed, using fallback: {e}")
