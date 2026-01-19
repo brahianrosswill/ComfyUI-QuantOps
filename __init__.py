@@ -196,12 +196,29 @@ def _register_layouts():
         from comfy.quant_ops import QUANT_ALGOS, register_layout_class
         import torch
 
-        # Import our layouts (this also registers their operation handlers)
-        from .quant_layouts.int8_layout import BlockWiseINT8Layout
-        from .quant_layouts.fp8_variants import RowWiseFP8Layout, BlockWiseFP8Layout
-
-        # Register layouts using the new comfy_kitchen API
+        # INT8: Requires comfy-kitchen
+        from comfy_kitchen.tensor import BlockWiseINT8Layout as _CKInt8Layout
+        
+        # Wrap ck layout with ComfyUI-compatible quantize() signature
+        class BlockWiseINT8Layout(_CKInt8Layout):
+            """Block-wise INT8 with per-block scaling, ComfyUI-compatible."""
+            
+            @classmethod
+            def quantize(cls, tensor, scale=None, stochastic_rounding=0, inplace_ops=False, **kwargs):
+                """Quantize matching TensorCoreFP8Layout.quantize() signature."""
+                is_weight = kwargs.get("is_weight", True)
+                block_size = kwargs.get("block_size", 128)
+                
+                if isinstance(scale, str) and scale == "recalculate":
+                    scale = None  # Let parent class compute scale
+                
+                return super().quantize(tensor, block_size=block_size, is_weight=is_weight, **kwargs)
+        
         register_layout_class("BlockWiseINT8Layout", BlockWiseINT8Layout)
+        logging.info("ComfyUI-QuantOps: Registered BlockWiseINT8Layout from comfy-kitchen")
+
+        # FP8 variants (local implementations)
+        from .quant_layouts.fp8_variants import RowWiseFP8Layout, BlockWiseFP8Layout
         register_layout_class("RowWiseFP8Layout", RowWiseFP8Layout)
         register_layout_class("BlockWiseFP8Layout", BlockWiseFP8Layout)
 
@@ -213,7 +230,6 @@ def _register_layouts():
                 "parameters": {"weight_scale", "input_scale"},
                 "comfy_tensor_layout": "BlockWiseINT8Layout",
                 "group_size": 128,
-                "asymmetric_layout": True,
             },
         )
         QUANT_ALGOS.setdefault(
