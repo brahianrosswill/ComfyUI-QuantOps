@@ -155,13 +155,13 @@ def _register_layouts():
             @classmethod
             def quantize(cls, tensor, scale=None, stochastic_rounding=0, inplace_ops=False, **kwargs):
                 """Quantize matching TensorCoreFP8Layout.quantize() signature."""
-                is_weight = kwargs.get("is_weight", True)
-                block_size = kwargs.get("block_size", 128)
+                is_weight = kwargs.pop("is_weight", False)  # Default False for activations (1D blocking)
+                block_size = kwargs.pop("block_size", 128)
                 
                 if isinstance(scale, str) and scale == "recalculate":
                     scale = None  # Let parent class compute scale
                 
-                return super().quantize(tensor, block_size=block_size, is_weight=is_weight, **kwargs)
+                return super().quantize(tensor, block_size=block_size, is_weight=is_weight)
         
         register_layout_class("BlockWiseINT8Layout", BlockWiseINT8Layout)
         logging.info("ComfyUI-QuantOps: Registered BlockWiseINT8Layout from comfy-kitchen")

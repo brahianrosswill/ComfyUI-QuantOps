@@ -371,7 +371,8 @@ class QuantizedOps(manual_cast):
                         input = input.reshape(-1, input_shape[2])
                     
                     if input.ndim == 2:
-                        input = QuantizedTensor.from_float(input, "BlockWiseINT8Layout")
+                        # is_weight=False: 1D blocking on K, only K needs to be divisible by 128
+                        input = QuantizedTensor.from_float(input, "BlockWiseINT8Layout", is_weight=False)
                         output = torch.nn.functional.linear(input, weight, bias)
                         if tensor_3d:
                             output = output.reshape(input_shape[0], input_shape[1], -1)
