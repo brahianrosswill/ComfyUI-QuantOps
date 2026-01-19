@@ -38,7 +38,6 @@ class QuantizedModelLoader:
             "required": {
                 "ckpt_name": (folder_paths.get_filename_list("checkpoints"),),
                 "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "nvfp4"],),
-                "kernel_backend": (["pytorch", "triton"],),
             },
             "optional": {
                 "force_dequant": (
@@ -58,9 +57,9 @@ class QuantizedModelLoader:
 
 
     def load_checkpoint(
-        self, ckpt_name, quant_format, kernel_backend, force_dequant=False
+        self, ckpt_name, quant_format, force_dequant=False
     ):
-        """Load a checkpoint with the specified quantization format and kernel backend."""
+        """Load a checkpoint with the specified quantization format."""
 
         # Get full checkpoint path
         ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
@@ -129,7 +128,6 @@ class QuantizedUNETLoader:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "nvfp4"],),
-                "kernel_backend": (["pytorch", "triton"],),
             },
         }
 
@@ -138,7 +136,7 @@ class QuantizedUNETLoader:
     CATEGORY = "loaders/quantized"
     DESCRIPTION = "Load diffusion models with custom quantization support. float8_e4m3fn (tensor-scaled) uses ComfyUI built-in. INT8/FP8 blockwise/rowwise use custom layouts."
 
-    def load_unet(self, unet_name, quant_format, kernel_backend):
+    def load_unet(self, unet_name, quant_format):
         """Load a UNET model with the specified settings."""
 
         # Get model path
@@ -208,7 +206,6 @@ class QuantizedCLIPLoader:
                 "clip_name": (folder_paths.get_filename_list("text_encoders"),),
                 "type": (cls.CLIP_TYPES,),
                 "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "nvfp4"],),
-                "kernel_backend": (["pytorch", "triton"],),
             },
         }
 
@@ -217,7 +214,7 @@ class QuantizedCLIPLoader:
     CATEGORY = "loaders/quantized"
     DESCRIPTION = "Load quantized text encoders (CLIP, T5, etc.). float8_e4m3fn (tensor-scaled) uses ComfyUI built-in. INT8/FP8 blockwise/rowwise use custom layouts."
 
-    def load_clip(self, clip_name, type, quant_format, kernel_backend):
+    def load_clip(self, clip_name, type, quant_format):
         """Load a CLIP/text encoder with quantization support."""
         import comfy.model_management
 
