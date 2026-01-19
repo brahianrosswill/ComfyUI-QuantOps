@@ -72,9 +72,9 @@ def _setup_comfy_kitchen_backends():
 
 def _register_quantops_backend():
     """
-    Register QuantOps Triton kernels with comfy-kitchen registry.
+    Register QuantOps FP8 Triton kernels with comfy-kitchen registry.
     
-    This allows ck dispatch to use our INT8/FP8 kernels.
+    Note: INT8 kernels are now provided by comfy-kitchen directly.
     """
     try:
         import torch
@@ -82,58 +82,18 @@ def _register_quantops_backend():
         from comfy_kitchen.constraints import (
             FunctionConstraints,
             ParamConstraint,
-            ExactDims,
-            DivisibleBy,
         )
         
-        # Import our kernel module
-        from .kernels import int8_kernels
+        # Import FP8 kernel module (INT8 is now handled by comfy-kitchen)
         from .kernels import fp8_kernels
         
         cuda_devices = frozenset({"cuda"})
-        standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
-        
-        # Build constraints for INT8 kernels
-        int8_constraints = {
-            "act_quant": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(
-                        dtypes=standard_floats,
-                        shape_rules=(DivisibleBy(-1, 128),),  # Last dim divisible by block_size
-                    ),
-                },
-                default_devices=cuda_devices,
-            ),
-            "act_dequant": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(dtypes=frozenset({torch.int8})),
-                    "s": ParamConstraint(dtypes=frozenset({torch.float32})),
-                },
-                default_devices=cuda_devices,
-            ),
-            "weight_quant": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(
-                        dtypes=standard_floats,
-                        shape_rules=(ExactDims(2),),
-                    ),
-                },
-                default_devices=cuda_devices,
-            ),
-            "weight_dequant": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(dtypes=frozenset({torch.int8})),
-                    "s": ParamConstraint(dtypes=frozenset({torch.float32})),
-                },
-                default_devices=cuda_devices,
-            ),
-        }
         
         # Build constraints for FP8 kernels
         fp8_constraints = {
             "fp8_act_quant": FunctionConstraints(
                 params={
-                    "x": ParamConstraint(dtypes=standard_floats),
+                    "x": ParamConstraint(dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})),
                 },
                 default_devices=cuda_devices,
             ),
@@ -156,17 +116,6 @@ def _register_quantops_backend():
                 default_devices=cuda_devices,
             ),
         }
-        
-        # Register INT8 backend
-        try:
-            registry.register(
-                name="quantops_int8",
-                module=int8_kernels,
-                capabilities=int8_constraints,
-            )
-            logging.info("ComfyUI-QuantOps: Registered quantops_int8 backend")
-        except Exception as e:
-            logging.debug(f"ComfyUI-QuantOps: Could not register INT8 backend: {e}")
         
         # Register FP8 backend
         try:

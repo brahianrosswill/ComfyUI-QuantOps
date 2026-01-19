@@ -77,8 +77,8 @@ class QuantizedModelLoader:
 
         # Load state dict with guaranteed float32 scales using our loader
         try:
-            from ..utils.safetensors_loader import load_fp8_state_dict
-            sd, metadata = load_fp8_state_dict(ckpt_path, force_scale_float32=True)
+            from ..utils.safetensors_loader import load_quantized_state_dict
+            sd, metadata = load_quantized_state_dict(ckpt_path, force_scale_float32=True)
             logging.info("QuantizedModelLoader: Loaded state dict with float32 scales")
             # Use ComfyUI's guess config with our pre-loaded state dict
             out = comfy.sd.load_state_dict_guess_config(
@@ -151,8 +151,8 @@ class QuantizedUNETLoader:
 
         # Load state dict with guaranteed float32 scales using our loader
         try:
-            from ..utils.safetensors_loader import load_fp8_state_dict
-            sd, metadata = load_fp8_state_dict(unet_path, force_scale_float32=True)
+            from ..utils.safetensors_loader import load_quantized_state_dict
+            sd, metadata = load_quantized_state_dict(unet_path, force_scale_float32=True)
             logging.info("QuantizedUNETLoader: Loaded state dict with float32 scales")
         except Exception as e:
             # Fallback to standard loading
