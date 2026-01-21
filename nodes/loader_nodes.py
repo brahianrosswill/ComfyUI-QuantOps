@@ -81,15 +81,11 @@ class QuantizedModelLoader:
         # Select ops class based on quant_format
         model_options = {}
         if quant_format == "int8_tensorwise":
-            try:
-                from ..tensorwise_int8_ops import TensorWiseInt8Ops
-
-                model_options = {"custom_operations": TensorWiseInt8Ops}
-                logging.info(
-                    "QuantizedModelLoader: Using TensorWiseInt8Ops (torch._int_mm)"
-                )
-            except ImportError as e:
-                logging.warning(f"TensorWiseInt8Ops not available: {e}")
+            # Uses TensorWiseInt8Layout registered in QUANT_ALGOS
+            # ComfyUI's mixed_precision_ops handles it automatically via comfy_quant metadata
+            logging.info(
+                "QuantizedModelLoader: Using TensorWiseInt8Layout (via mixed_precision_ops)"
+            )
         elif quant_format == "int8":
             try:
                 from ..int8_ops import HybridINT8Ops
@@ -127,15 +123,14 @@ class QuantizedModelLoader:
                 logging.info(f"QuantizedModelLoader: Auto-detected format: {detected_format}")
 
                 # Select ops based on detected format
-                if detected_format == "int8_tensorwise":
-                    from ..tensorwise_int8_ops import TensorWiseInt8Ops
-                    model_options = {"custom_operations": TensorWiseInt8Ops}
-                elif detected_format == "int8_blockwise":
+                # int8_tensorwise uses TensorWiseInt8Layout via mixed_precision_ops (no custom ops)
+                if detected_format == "int8_blockwise":
                     from ..int8_ops import HybridINT8Ops
                     model_options = {"custom_operations": HybridINT8Ops}
                 elif detected_format in ("float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "nvfp4"):
                     from ..fp8_ops import HybridFP8Ops
                     model_options = {"custom_operations": HybridFP8Ops}
+                # int8_tensorwise and float8_e4m3fn use registered layouts (no custom ops needed)
             except Exception as e:
                 logging.warning(f"QuantizedModelLoader: Format detection failed: {e}")
 
@@ -222,13 +217,9 @@ class QuantizedUNETLoader:
         # Select ops class based on quant_format
         model_options = {}
         if quant_format == "int8_tensorwise":
-            try:
-                from ..tensorwise_int8_ops import TensorWiseInt8Ops
-
-                model_options = {"custom_operations": TensorWiseInt8Ops}
-                logging.info("QuantizedUNETLoader: Using TensorWiseInt8Ops (torch._int_mm)")
-            except ImportError as e:
-                logging.warning(f"TensorWiseInt8Ops not available: {e}")
+            # Uses TensorWiseInt8Layout registered in QUANT_ALGOS
+            # ComfyUI's mixed_precision_ops handles it automatically via comfy_quant metadata
+            logging.info("QuantizedUNETLoader: Using TensorWiseInt8Layout (via mixed_precision_ops)")
         elif quant_format == "int8":
             try:
                 from ..int8_ops import HybridINT8Ops
@@ -263,15 +254,14 @@ class QuantizedUNETLoader:
                 logging.info(f"QuantizedUNETLoader: Auto-detected format: {detected_format}")
 
                 # Select ops based on detected format
-                if detected_format == "int8_tensorwise":
-                    from ..tensorwise_int8_ops import TensorWiseInt8Ops
-                    model_options = {"custom_operations": TensorWiseInt8Ops}
-                elif detected_format == "int8_blockwise":
+                # int8_tensorwise uses TensorWiseInt8Layout via mixed_precision_ops (no custom ops)
+                if detected_format == "int8_blockwise":
                     from ..int8_ops import HybridINT8Ops
                     model_options = {"custom_operations": HybridINT8Ops}
                 elif detected_format in ("float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "nvfp4"):
                     from ..fp8_ops import HybridFP8Ops
                     model_options = {"custom_operations": HybridFP8Ops}
+                # int8_tensorwise and float8_e4m3fn use registered layouts (no custom ops needed)
             except Exception as e:
                 logging.warning(f"QuantizedUNETLoader: Format detection failed: {e}")
 
@@ -375,15 +365,14 @@ class QuantizedCLIPLoader:
                 logging.info(f"QuantizedCLIPLoader: Auto-detected format: {detected_format}")
 
                 # Select ops based on detected format
-                if detected_format == "int8_tensorwise":
-                    from ..tensorwise_int8_ops import TensorWiseInt8Ops
-                    model_options["custom_operations"] = TensorWiseInt8Ops
-                elif detected_format == "int8_blockwise":
+                # int8_tensorwise uses TensorWiseInt8Layout via mixed_precision_ops (no custom ops)
+                if detected_format == "int8_blockwise":
                     from ..int8_ops import HybridINT8Ops
                     model_options["custom_operations"] = HybridINT8Ops
                 elif detected_format in ("float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "nvfp4"):
                     from ..fp8_ops import HybridFP8Ops
                     model_options["custom_operations"] = HybridFP8Ops
+                # int8_tensorwise and float8_e4m3fn use registered layouts (no custom ops needed)
             except Exception as e:
                 logging.warning(f"QuantizedCLIPLoader: Format detection failed: {e}")
 
@@ -394,9 +383,8 @@ class QuantizedCLIPLoader:
             sd = comfy.utils.load_torch_file(clip_path, safe_load=True)
 
             if quant_format == "int8_tensorwise":
-                from ..tensorwise_int8_ops import TensorWiseInt8Ops
-                model_options["custom_operations"] = TensorWiseInt8Ops
-                logging.info("QuantizedCLIPLoader: Using TensorWiseInt8Ops")
+                # Uses TensorWiseInt8Layout via mixed_precision_ops (no custom ops)
+                logging.info("QuantizedCLIPLoader: Using TensorWiseInt8Layout (via mixed_precision_ops)")
             elif quant_format == "int8":
                 from ..int8_ops import HybridINT8Ops
                 model_options["custom_operations"] = HybridINT8Ops

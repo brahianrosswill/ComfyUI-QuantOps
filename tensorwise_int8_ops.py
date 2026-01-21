@@ -297,19 +297,24 @@ class TensorWiseInt8Ops(manual_cast):
             return weight
 
         def set_weight(self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs):
-            """Set weight after LoRA patching."""
-            # For now, keep as dequantized (re-quantization is complex for INT8)
+            """Set weight after LoRA patching - re-quantize to INT8."""
+            # Re-quantize the patched weight back to INT8
+            weight_int8, weight_scale = quantize_int8_tensorwise(weight)
+            
             if return_weight:
-                return weight
+                # Store scale for later use
+                self.weight_scale = weight_scale.item() if weight_scale.numel() == 1 else weight_scale
+                self._is_quantized = True
+                return weight_int8
 
             if inplace_update:
-                self.weight.data.copy_(weight)
+                self.weight.data.copy_(weight_int8)
             else:
-                self.weight = nn.Parameter(weight, requires_grad=False)
+                self.weight = nn.Parameter(weight_int8, requires_grad=False)
 
-            # Mark as no longer quantized after patching
-            self._is_quantized = False
-            self.weight_scale = None
+            # Update scale and mark as quantized
+            self.weight_scale = weight_scale.item() if weight_scale.numel() == 1 else weight_scale
+            self._is_quantized = True
 
     # Normalization layers - use standard manual_cast versions
     class GroupNorm(manual_cast.GroupNorm):

@@ -234,6 +234,7 @@ def _register_layouts():
         register_layout_class("RowWiseFP8Layout", RowWiseFP8Layout)
         register_layout_class("BlockWiseFP8Layout", BlockWiseFP8Layout)
         register_layout_class("TensorWiseInt8Layout", TensorWiseInt8Layout)
+        logging.info("ComfyUI-QuantOps: Registered TensorWiseInt8Layout")
 
         # Register QUANT_ALGOS
         QUANT_ALGOS.setdefault(
@@ -244,6 +245,7 @@ def _register_layouts():
                 "comfy_tensor_layout": "TensorWiseInt8Layout",
             },
         )
+        logging.info("ComfyUI-QuantOps: Registered int8_tensorwise in QUANT_ALGOS")
         QUANT_ALGOS.setdefault(
             "int8_blockwise",
             {
