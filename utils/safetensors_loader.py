@@ -208,3 +208,143 @@ def get_layer_metadata(
             except (ValueError, json.JSONDecodeError):
                 pass
     return None
+
+
+def get_quantization_metadata(filepath: str) -> Optional[dict]:
+    """
+    Read _quantization_metadata from safetensors header without loading tensors.
+    
+    Args:
+        filepath: Path to safetensors file
+        
+    Returns:
+        Dict with quantization metadata or None if not found
+    """
+    import logging
+    
+    try:
+        with MemoryEfficientSafeOpen(filepath, device="cpu") as f:
+            metadata = f.header.get("__metadata__", {})
+            if "_quantization_metadata" in metadata:
+                quant_meta = json.loads(metadata["_quantization_metadata"])
+                logging.info(f"[Header Detection] Found _quantization_metadata: {quant_meta.get('format', 'unknown')}")
+                return quant_meta
+    except Exception as e:
+        logging.debug(f"[Header Detection] Error reading metadata: {e}")
+    
+    return None
+
+
+def detect_quant_format(filepath: str) -> str:
+    """
+    Detect quantization format from safetensors file header without loading full model.
+    
+    Detection priority:
+    1. _quantization_metadata in header (fastest, explicit)
+    2. comfy_quant tensors in first layer
+    3. Weight dtype and scale shape analysis
+    
+    Args:
+        filepath: Path to safetensors file
+        
+    Returns:
+        Format string: "mxfp8", "nvfp4", "int8", "int8_blockwise", "float8_e4m3fn", "bfloat16", or "unknown"
+    """
+    import logging
+    
+    logging.info(f"[Header Detection] Detecting format for: {filepath}")
+    
+    # 1. Check _quantization_metadata first (fastest)
+    quant_meta = get_quantization_metadata(filepath)
+    if quant_meta:
+        fmt = quant_meta.get("format", "").lower()
+        if fmt:
+            logging.info(f"[Header Detection] Detected from metadata: {fmt}")
+            return fmt
+    
+    try:
+        with MemoryEfficientSafeOpen(filepath, device="cpu") as f:
+            keys = f.keys()
+            
+            # 2. Check for comfy_quant tensors
+            comfy_quant_keys = [k for k in keys if k.endswith(".comfy_quant")]
+            if comfy_quant_keys:
+                try:
+                    first_quant = f.get_tensor_as_dict(comfy_quant_keys[0])
+                    fmt = first_quant.get("format", "").lower()
+                    if fmt:
+                        logging.info(f"[Header Detection] Detected from comfy_quant: {fmt}")
+                        return fmt
+                except Exception:
+                    pass
+            
+            # 3. Analyze header dtypes and scales
+            weight_keys = [k for k in keys if k.endswith(".weight") and not _is_scale_tensor(k)]
+            scale_keys = [k for k in keys if _is_scale_tensor(k)]
+            
+            if weight_keys:
+                first_weight_key = weight_keys[0]
+                first_weight_meta = f.header.get(first_weight_key, {})
+                dtype = first_weight_meta.get("dtype", "")
+                
+                # MXFP8 detection
+                if dtype in ("F8_E4M3", "F8_E5M2"):
+                    # Check for weight_scale_2 (NVFP4) vs normal (MXFP8/FP8)
+                    has_scale_2 = any("weight_scale_2" in k for k in scale_keys)
+                    if has_scale_2:
+                        logging.info(f"[Header Detection] Detected NVFP4 from dtype={dtype} + weight_scale_2")
+                        return "nvfp4"
+                    
+                    # Check for mxfp8 by looking at scale tensor shapes
+                    matching_scales = [k for k in scale_keys if k.replace("weight_scale", "weight") == first_weight_key or 
+                                       first_weight_key.replace(".weight", ".weight_scale") == k]
+                    if matching_scales:
+                        scale_meta = f.header.get(matching_scales[0], {})
+                        scale_shape = scale_meta.get("shape", [])
+                        weight_shape = first_weight_meta.get("shape", [])
+                        
+                        # MXFP8 has scales with reduced dimensions (32-element blocks)
+                        if len(scale_shape) == len(weight_shape):
+                            logging.info(f"[Header Detection] Detected MXFP8 from dtype={dtype} + scale shape pattern")
+                            return "mxfp8"
+                    
+                    logging.info(f"[Header Detection] Detected float8_e4m3fn from dtype={dtype}")
+                    return "float8_e4m3fn"
+                
+                # INT8 detection
+                elif dtype == "I8":
+                    if scale_keys:
+                        # Find matching scale for first weight
+                        matching_scales = [k for k in scale_keys if first_weight_key.replace(".weight", "") in k]
+                        if matching_scales:
+                            scale_meta = f.header.get(matching_scales[0], {})
+                            scale_shape = scale_meta.get("shape", [])
+                            
+                            # Scalar or 1-element = simple INT8, 2D = blockwise
+                            if len(scale_shape) == 0 or (len(scale_shape) == 1 and scale_shape[0] == 1):
+                                logging.info(f"[Header Detection] Detected int8 from I8 dtype + scalar scale")
+                                return "int8"
+                            elif len(scale_shape) == 2:
+                                logging.info(f"[Header Detection] Detected int8_blockwise from I8 dtype + 2D scale")
+                                return "int8_blockwise"
+                    
+                    logging.info(f"[Header Detection] Detected int8 from I8 dtype (no scale found)")
+                    return "int8"
+                
+                # BFloat16 / Float16
+                elif dtype == "BF16":
+                    logging.info(f"[Header Detection] Detected bfloat16 (not quantized)")
+                    return "bfloat16"
+                elif dtype == "F16":
+                    logging.info(f"[Header Detection] Detected float16 (not quantized)")
+                    return "float16"
+                elif dtype == "F32":
+                    logging.info(f"[Header Detection] Detected float32 (not quantized)")
+                    return "float32"
+    
+    except Exception as e:
+        logging.warning(f"[Header Detection] Error during detection: {e}")
+    
+    logging.warning(f"[Header Detection] Could not detect format, returning 'unknown'")
+    return "unknown"
+
