@@ -82,18 +82,33 @@ class TensorWiseInt8Ops(manual_cast):
 
             if weight_tensor is not None:
                 if weight_tensor.dtype == torch.int8 and weight_scale is not None:
-                    # Direct INT8 load
+                    # Wrap in QuantizedTensor with TensorWiseInt8Layout for proper dispatch
                     self._is_quantized = True
-                    self.weight = nn.Parameter(weight_tensor, requires_grad=False)
-
-                    # Store scale as scalar or tensor
+                    
+                    # Normalize scale to tensor
                     if isinstance(weight_scale, torch.Tensor):
-                        if weight_scale.numel() == 1:
-                            self.weight_scale = weight_scale.float().item()
-                        else:
-                            self.weight_scale = weight_scale.float()
+                        scale_tensor = weight_scale.float()
+                        if scale_tensor.numel() == 1:
+                            scale_tensor = scale_tensor.squeeze()
                     else:
-                        self.weight_scale = float(weight_scale)
+                        scale_tensor = torch.tensor(float(weight_scale), dtype=torch.float32)
+                    
+                    # Also store as instance attr for fallback paths
+                    self.weight_scale = scale_tensor.item() if scale_tensor.numel() == 1 else scale_tensor
+                    
+                    # Create QuantizedTensor with TensorWiseInt8Layout
+                    from .quant_layouts.tensorwise_int8_layout import TensorWiseInt8Layout
+                    from comfy.quant_ops import QuantizedTensor
+                    
+                    layout_params = TensorWiseInt8Layout.Params(
+                        scale=scale_tensor,
+                        orig_dtype=torch.bfloat16,  # Updated in forward
+                        orig_shape=tuple(weight_tensor.shape),
+                    )
+                    self.weight = nn.Parameter(
+                        QuantizedTensor(weight_tensor, "TensorWiseInt8Layout", layout_params),
+                        requires_grad=False
+                    )
 
                     # Store input scale if present (for static quantization)
                     if input_scale is not None:
@@ -137,25 +152,47 @@ class TensorWiseInt8Ops(manual_cast):
                 uncast_bias_weight(self, weight, bias, offload_stream)
                 return out
 
-            # Quantized path - use fast int8 matmul
-            compute_dtype = input.dtype if input.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+            weight = self.weight
+            if isinstance(weight, nn.Parameter):
+                weight = weight.data
+            
+            input_dtype = input.dtype
+            
+            # Handle QuantizedTensor (triggers dispatch to tensorwise_int8_linear)
+            from comfy.quant_ops import QuantizedTensor
+            if isinstance(weight, QuantizedTensor):
+                # Move to input device if needed
+                if weight.device != input.device:
+                    weight = weight.to(device=input.device)
+                
+                # Update orig_dtype in params
+                if hasattr(weight, '_params'):
+                    object.__setattr__(weight._params, 'orig_dtype', input_dtype)
+                
+                bias = self.bias
+                if bias is not None:
+                    bias = bias.to(device=input.device, dtype=input_dtype)
+                
+                # This triggers QuantizedTensor dispatch -> tensorwise_int8_linear handler
+                return F.linear(input, weight, bias)
+            
+            # Fallback: raw INT8 tensor path (shouldn't normally reach here anymore)
+            compute_dtype = input_dtype if input_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
 
             # Flatten to 2D for matmul
             x_shape = input.shape
             x_2d = input.reshape(-1, x_shape[-1])
 
             # Move weight to input device
-            weight = self.weight.data.to(device=input.device)
+            weight = weight.to(device=input.device)
 
-            # Always use INT8 matmul (no dequantize fallback to prevent OOM)
+            # Use INT8 matmul
             if self.input_scale is not None:
-                # Static quantization path
                 y = _int8_forward_static(
                     x_2d, weight, self.weight_scale,
                     self.input_scale, self.bias, compute_dtype
                 )
             else:
-                # Dynamic activation quantization (default)
                 y = _int8_forward_dynamic(
                     x_2d, weight, self.weight_scale,
                     self.bias, compute_dtype
@@ -184,26 +221,36 @@ class TensorWiseInt8Ops(manual_cast):
             if not hasattr(TensorWiseInt8Ops.Linear, '_fused_lora_log_count'):
                 TensorWiseInt8Ops.Linear._fused_lora_log_count = 0
             if TensorWiseInt8Ops.Linear._fused_lora_log_count < 3:
-                weight = self.weight.data
-                logging.info(f"TensorWiseINT8: Using fused LoRA path - input={input.shape}, weight={weight.shape}")
+                logging.info(f"TensorWiseINT8: Using fused LoRA path - input={input.shape}")
                 TensorWiseInt8Ops.Linear._fused_lora_log_count += 1
 
             # Flatten to 2D for matmul
             x_shape = input.shape
             x_2d = input.reshape(-1, x_shape[-1])
 
-            # Move weight to input device
-            weight = self.weight.data.to(device=input.device)
+            # Get weight data - handle both QuantizedTensor and raw tensor
+            weight = self.weight
+            if isinstance(weight, nn.Parameter):
+                weight = weight.data
+            
+            from comfy.quant_ops import QuantizedTensor
+            if isinstance(weight, QuantizedTensor):
+                # Extract raw INT8 data and scale
+                weight_int8 = weight._qdata.to(device=input.device)
+                weight_scale = weight._params.scale
+            else:
+                weight_int8 = weight.to(device=input.device)
+                weight_scale = self.weight_scale
 
             # 1. Base INT8 output (no LoRA applied) - always use INT8 matmul
             if self.input_scale is not None:
                 base_out = _int8_forward_static(
-                    x_2d, weight, self.weight_scale,
+                    x_2d, weight_int8, weight_scale,
                     self.input_scale, None, compute_dtype
                 )
             else:
                 base_out = _int8_forward_dynamic(
-                    x_2d, weight, self.weight_scale,
+                    x_2d, weight_int8, weight_scale,
                     None, compute_dtype
                 )
 
@@ -277,7 +324,8 @@ class TensorWiseInt8Ops(manual_cast):
 
             # Check if we have LoRA patches AND quantized weight
             has_lora = len(self.weight_function) > 0
-            is_quant = self._is_quantized and weight.dtype == torch.int8
+            from comfy.quant_ops import QuantizedTensor
+            is_quant = isinstance(weight, QuantizedTensor) or (self._is_quantized and weight.dtype == torch.int8)
 
             if has_lora and is_quant:
                 # Use fused LoRA path to avoid full weight dequantization
