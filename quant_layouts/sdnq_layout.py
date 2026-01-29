@@ -312,13 +312,14 @@ def _sdnq_int8_matmul(input_tensor, weight_qt, bias, params):
     weight_int8 = weight_qt._qdata.to(device)  # Packed int8 weight data
     weight_scale = params.scale.to(device, dtype=torch.float32)
     
-    # CRITICAL: Use params.orig_shape for actual layer dimensions, not weight_qt.shape (packed)
-    # orig_shape is [out_features, in_features] for linear layers
+    # CRITICAL: Handle transposed weights correctly
     out_features, in_features = params.orig_shape
     output_shape = (*input_tensor.shape[:-1], out_features)
     
-    # Reshape weight from packed format to [out_features, in_features]
-    weight_int8 = weight_int8.reshape(out_features, in_features)
+    if params.transposed:
+        weight_int8 = weight_int8.reshape(in_features, out_features)  # Already [K, N]
+    else:
+        weight_int8 = weight_int8.reshape(out_features, in_features)  # [N, K]
     
     # Handle SVD: fuse with bias (sdnext line 38-43)
     # Use the SAME pattern as the working dequant path (lines 427-437)
@@ -326,12 +327,10 @@ def _sdnq_int8_matmul(input_tensor, weight_qt, bias, params):
         svd_up, svd_down = _get_sdnq_svd_tensors(params, device, dtype)
         x_flat = input_tensor.flatten(0, -2)
         if params.transposed:
-            # Logical W = Q + U @ V -> X @ (Q + U @ V) = X @ Q + (X @ U) @ V
-            # svd_up: (Out_stored, Rank), svd_down: (Rank, In_stored)
-            svd_correction = torch.mm(torch.mm(x_flat, svd_up), svd_down)
+            # Transposed weights: svd shapes already match [in, rank] and [rank, out]
+            svd_correction = torch.mm(torch.mm(x_flat, svd_down), svd_up)
         else:
-            # Logical W = Q + U @ V^T -> X @ (Q^T + V @ U^T) = X @ Q^T + (X @ V) @ U^T
-            # svd_up: (Out, Rank), svd_down: (Rank, In)
+            # Normal: need transpose
             svd_correction = torch.mm(torch.mm(x_flat, svd_down.t()), svd_up.t())
         
         if bias is not None:
@@ -339,32 +338,31 @@ def _sdnq_int8_matmul(input_tensor, weight_qt, bias, params):
         else:
             bias = svd_correction.to(dtype)
     
-    # Dynamically quantize input (sdnext line 14-20)
+    # Dynamically quantize input
     input_flat = input_tensor.flatten(0, -2).to(weight_scale.dtype)
     input_scale = torch.amax(input_flat.abs(), dim=-1, keepdims=True) / 127.0
     input_int8 = (input_flat / input_scale).round().clamp(-127, 127).to(torch.int8)
     
-    # Merge scales properly (sdnext line 17)
-    # CRITICAL: Do NOT modify weight_scale (refs params.scale) - use view/reshape only!
-    # input_scale: [M, 1], weight_scale: could be [out_features, 1], [out_features], or [1, out_features]
-    # Need: [M, 1] * [1, out_features] -> [M, out_features]
-    if weight_scale.ndim > 1:
-        weight_scale_1d = weight_scale.reshape(-1)  # View, not copy
+    # Int8 matmul: (M, K) @ (K, N) -> (M, N)
+    if params.transposed:
+        output_int32 = torch._int_mm(input_int8, weight_int8)
     else:
-        weight_scale_1d = weight_scale
-    merged_scale = input_scale * weight_scale_1d.unsqueeze(0)
-    if merged_scale.dtype == torch.float16:
-        merged_scale = merged_scale.to(torch.float32)  # Prevent overflow
+        output_int32 = torch._int_mm(input_int8, weight_int8.t())
     
-    # Int8 matmul using torch._int_mm (sdnext line 47)
-    # torch._int_mm expects (M, K) @ (K, N) -> (M, N)
-    # weight is [N, K], need to transpose to [K, N]
-    output_int32 = torch._int_mm(input_int8, weight_int8.t())
+    # Dequantize: apply scales separately to avoid creating [M, N] merged tensor
+    # Ensure scale is float32 to prevent overflow
+    if input_scale.dtype == torch.float16:
+        input_scale = input_scale.to(torch.float32)
+    if weight_scale.ndim > 1:
+        weight_scale_1d = weight_scale.reshape(-1).to(torch.float32)
+    else:
+        weight_scale_1d = weight_scale.to(torch.float32)
     
-    # Dequantize: int32 * scale + bias (sdnext line 47-49)
-    output_fp = output_int32.to(merged_scale.dtype) * merged_scale
+    # Apply scales sequentially (avoids creating merged [M,N] tensor)
+    output_fp = output_int32.to(torch.float32) * input_scale  # [M, N] * [M, 1]
+    output_fp = output_fp * weight_scale_1d.unsqueeze(0)      # [M, N] * [1, N]
     if bias is not None:
-        output_fp = output_fp + bias.to(device, merged_scale.dtype)
+        output_fp = output_fp + bias.to(device, torch.float32)
     
     # Reshape and cast to output dtype
     output = output_fp.reshape(output_shape)
