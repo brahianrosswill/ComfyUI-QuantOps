@@ -37,7 +37,7 @@ class QuantizedModelLoader:
         return {
             "required": {
                 "ckpt_name": (folder_paths.get_filename_list("checkpoints"),),
-                "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4"],),
+                "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4", "sdnq"],),
                 "kernel_backend": (["pytorch", "triton"],),
             },
             "optional": {
@@ -107,6 +107,14 @@ class QuantizedModelLoader:
                 )
             except ImportError as e:
                 logging.warning(f"HybridFP8Ops not available: {e}")
+        elif quant_format == "sdnq":
+            try:
+                from ..sdnq_ops import HybridSDNQOps
+
+                model_options = {"custom_operations": HybridSDNQOps}
+                logging.info("QuantizedModelLoader: Using HybridSDNQOps for SDNQ models")
+            except ImportError as e:
+                logging.warning(f"HybridSDNQOps not available: {e}")
         else:  # auto
             # Try INT8 as fallback for auto mode
             try:
@@ -170,7 +178,7 @@ class QuantizedUNETLoader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4"],),
+                "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4", "sdnq"],),
                 "kernel_backend": (["pytorch", "triton"],),
             },
         }
@@ -225,6 +233,14 @@ class QuantizedUNETLoader:
                 )
             except ImportError as e:
                 logging.warning(f"HybridFP8Ops not available: {e}")
+        elif quant_format == "sdnq":
+            try:
+                from ..sdnq_ops import HybridSDNQOps
+
+                model_options = {"custom_operations": HybridSDNQOps}
+                logging.info("QuantizedUNETLoader: Using HybridSDNQOps for SDNQ models")
+            except ImportError as e:
+                logging.warning(f"HybridSDNQOps not available: {e}")
         else:  # auto
             try:
                 from ..int8_ops import HybridINT8Ops
@@ -292,7 +308,7 @@ class QuantizedCLIPLoader:
             "required": {
                 "clip_name": (folder_paths.get_filename_list("text_encoders"),),
                 "type": (cls.CLIP_TYPES,),
-                "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4"],),
+                "quant_format": (["auto", "int8", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4", "sdnq"],),
                 "kernel_backend": (["pytorch", "triton"],),
             },
         }
@@ -361,6 +377,14 @@ class QuantizedCLIPLoader:
                 )
             except ImportError as e:
                 logging.warning(f"HybridFP8Ops not available: {e}")
+        elif quant_format == "sdnq":
+            try:
+                from ..sdnq_ops import HybridSDNQOps
+
+                model_options["custom_operations"] = HybridSDNQOps
+                logging.info("QuantizedCLIPLoader: Using HybridSDNQOps for SDNQ text encoder")
+            except ImportError as e:
+                logging.warning(f"HybridSDNQOps not available: {e}")
         else:  # auto
             # Try INT8 as fallback for auto mode
             try:

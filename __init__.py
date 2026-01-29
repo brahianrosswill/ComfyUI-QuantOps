@@ -199,11 +199,13 @@ def _register_layouts():
         # Import our layouts (this also registers their operation handlers)
         from .quant_layouts.int8_layout import BlockWiseINT8Layout
         from .quant_layouts.fp8_variants import RowWiseFP8Layout, BlockWiseFP8Layout
+        from .quant_layouts.sdnq_layout import SDNQLayout
 
         # Register layouts using the new comfy_kitchen API
         register_layout_class("BlockWiseINT8Layout", BlockWiseINT8Layout)
         register_layout_class("RowWiseFP8Layout", RowWiseFP8Layout)
         register_layout_class("BlockWiseFP8Layout", BlockWiseFP8Layout)
+        register_layout_class("SDNQLayout", SDNQLayout)
 
         # Register QUANT_ALGOS
         QUANT_ALGOS.setdefault(
@@ -281,8 +283,18 @@ def _register_layouts():
             },
         )
 
+        # SDNQ
+        QUANT_ALGOS.setdefault(
+            "sdnq",
+            {
+                "storage_t": torch.uint8,  # SDNQ uses packed uint8 for low-bit weights
+                "parameters": {"weight_scale", "weight_zp", "svd_up", "svd_down"},
+                "comfy_tensor_layout": "SDNQLayout",
+            },
+        )
+
         # Verify registration
-        registered = ["BlockWiseINT8Layout", "RowWiseFP8Layout", "BlockWiseFP8Layout", "TensorCoreMXFP8Layout"]
+        registered = ["BlockWiseINT8Layout", "RowWiseFP8Layout", "BlockWiseFP8Layout", "TensorCoreMXFP8Layout", "SDNQLayout"]
         logging.info(f"ComfyUI-QuantOps: Registered layouts: {registered}")
 
     except Exception as e:
