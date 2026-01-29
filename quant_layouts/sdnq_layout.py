@@ -290,14 +290,91 @@ def _get_sdnq_svd_tensors(params, device=None, dtype=None):
         svd_up = svd_up.t()
     if svd_down.shape[1] != flat_n_orig and svd_down.shape[0] == flat_n_orig:
         svd_down = svd_down.t()
-        
+    
     return svd_up, svd_down
+
+def _sdnq_int8_matmul(input_tensor, weight_qt, bias, params):
+    """
+    SDNQ int8 matmul - adapted from sdnext linear_int8.py
+    
+    Performs fast int8 matrix multiplication with dynamic activation quantization.
+    Fuses SVD correction with bias for efficiency.
+    """
+    # Fallback for small batches (sdnext line 53)
+    # torch._int_mm requires batch size > 16
+    if torch.numel(input_tensor) / input_tensor.shape[-1] < 32:
+        # Dequantize and use standard float matmul for small batches
+        weight_dequant = SDNQLayout.dequantize(weight_qt._qdata, params)
+        return torch.nn.functional.linear(input_tensor, weight_dequant, bias)
+    
+    device = input_tensor.device
+    dtype = input_tensor.dtype
+    weight_int8 = weight_qt._qdata.to(device)  # Packed int8 weight data
+    weight_scale = params.scale.to(device, dtype=torch.float32)
+    
+    # CRITICAL: Use params.orig_shape for actual layer dimensions, not weight_qt.shape (packed)
+    # orig_shape is [out_features, in_features] for linear layers
+    out_features, in_features = params.orig_shape
+    output_shape = (*input_tensor.shape[:-1], out_features)
+    
+    # Reshape weight from packed format to [out_features, in_features]
+    weight_int8 = weight_int8.reshape(out_features, in_features)
+    
+    # Handle SVD: fuse with bias (sdnext line 38-43)
+    # Use the SAME pattern as the working dequant path (lines 427-437)
+    if params.svd_up is not None and params.svd_down is not None:
+        svd_up, svd_down = _get_sdnq_svd_tensors(params, device, dtype)
+        x_flat = input_tensor.flatten(0, -2)
+        if params.transposed:
+            # Logical W = Q + U @ V -> X @ (Q + U @ V) = X @ Q + (X @ U) @ V
+            # svd_up: (Out_stored, Rank), svd_down: (Rank, In_stored)
+            svd_correction = torch.mm(torch.mm(x_flat, svd_up), svd_down)
+        else:
+            # Logical W = Q + U @ V^T -> X @ (Q^T + V @ U^T) = X @ Q^T + (X @ V) @ U^T
+            # svd_up: (Out, Rank), svd_down: (Rank, In)
+            svd_correction = torch.mm(torch.mm(x_flat, svd_down.t()), svd_up.t())
+        
+        if bias is not None:
+            bias = bias.to(device, dtype) + svd_correction.to(dtype)
+        else:
+            bias = svd_correction.to(dtype)
+    
+    # Dynamically quantize input (sdnext line 14-20)
+    input_flat = input_tensor.flatten(0, -2).to(weight_scale.dtype)
+    input_scale = torch.amax(input_flat.abs(), dim=-1, keepdims=True) / 127.0
+    input_int8 = (input_flat / input_scale).round().clamp(-127, 127).to(torch.int8)
+    
+    # Merge scales properly (sdnext line 17)
+    # CRITICAL: Do NOT modify weight_scale (refs params.scale) - use view/reshape only!
+    # input_scale: [M, 1], weight_scale: could be [out_features, 1], [out_features], or [1, out_features]
+    # Need: [M, 1] * [1, out_features] -> [M, out_features]
+    if weight_scale.ndim > 1:
+        weight_scale_1d = weight_scale.reshape(-1)  # View, not copy
+    else:
+        weight_scale_1d = weight_scale
+    merged_scale = input_scale * weight_scale_1d.unsqueeze(0)
+    if merged_scale.dtype == torch.float16:
+        merged_scale = merged_scale.to(torch.float32)  # Prevent overflow
+    
+    # Int8 matmul using torch._int_mm (sdnext line 47)
+    # torch._int_mm expects (M, K) @ (K, N) -> (M, N)
+    # weight is [N, K], need to transpose to [K, N]
+    output_int32 = torch._int_mm(input_int8, weight_int8.t())
+    
+    # Dequantize: int32 * scale + bias (sdnext line 47-49)
+    output_fp = output_int32.to(merged_scale.dtype) * merged_scale
+    if bias is not None:
+        output_fp = output_fp + bias.to(device, merged_scale.dtype)
+    
+    # Reshape and cast to output dtype
+    output = output_fp.reshape(output_shape)
+    return output.to(dtype)
 
 @register_layout_op(torch.ops.aten.linear.default, SDNQLayout)
 def sdnq_linear(func, args, kwargs):
     """
     SDNQ linear operation.
-    Optimized to compute SVD correction separately and cache dequantized base weights.
+    Optimized to use int8 matmul for int8 weights, dequant for others.
     """
     input_tensor = args[0]
     weight = args[1]
@@ -305,6 +382,12 @@ def sdnq_linear(func, args, kwargs):
 
     if isinstance(weight, QuantizedTensor):
         params = weight._params
+        
+        # Use int8 matmul path for int8 weights
+        if params.weights_dtype == "int8":
+            return _sdnq_int8_matmul(input_tensor, weight, bias, params)
+        
+        # Existing dequant path for other dtypes
         
         # Split execution if SVD is present
         if params.svd_up is not None and params.svd_down is not None:
