@@ -6,9 +6,11 @@ quantized models.
 """
 
 import torch
+import torch.nn.functional as F
 import logging
 from comfy.ops import manual_cast, cast_bias_weight, uncast_bias_weight
 from comfy.quant_ops import QuantizedTensor
+from comfy.model_patcher import LowVramPatch
 
 
 class SDNQLayerMixin:
@@ -143,7 +145,8 @@ class SDNQLayerMixin:
             if hasattr(weight, "_params"):
                 object.__setattr__(weight._params, "orig_dtype", input.dtype)
             
-            bias = self.bias
+            # Support passing explicit bias or using self.bias
+            bias = kwargs.get("bias", self.bias)
             if bias is not None:
                 bias = bias.to(device=input.device, dtype=input.dtype)
             
@@ -191,8 +194,110 @@ class HybridSDNQOps(manual_cast):
             uncast_bias_weight(self, weight, bias, offload_stream)
             return out
 
+        def forward_fused_lora(self, input):
+            """
+            Memory-efficient LoRA forward pass for SDNQ.
+            
+            Computes: output = base_sdnq_matmul(x, W) + lora_contribution(x)
+            
+            This avoids dequantizing the full SDNQ weight (which involves SVD reconstruction
+            and full tensor materialization) when LoRAs are present.
+            """
+            input_dtype = input.dtype
+            
+            # 1. Base SDNQ output (no LoRA applied, no bias applied yet)
+            # We explicitly pass bias=None to get just the matmul result
+            base_out = self._sdnq_forward(input, bias=None)
+            
+            if base_out is None:
+                # Fallback if not quantized
+                weight, bias, offload_stream = cast_bias_weight(self, input, offloadable=True)
+                base_out = torch.nn.functional.linear(input, weight, None)
+                uncast_bias_weight(self, weight, bias, offload_stream)
+
+            # 2. Compute LoRA contributions separately
+            lora_out = None
+            for patch_fn in self.weight_function:
+                if isinstance(patch_fn, LowVramPatch):
+                    # Extract patches for this layer
+                    patches = patch_fn.patches.get(patch_fn.key, [])
+                    for patch_data in patches:
+                        # patch_data: (strength_patch, adapter, strength_model, offset, function)
+                        strength_patch = patch_data[0]
+                        adapter = patch_data[1]
+                        strength_model = patch_data[2]
+                        
+                        # Check if adapter has weights (LoRA-style adapters)
+                        if hasattr(adapter, 'weights') and adapter.weights is not None:
+                            weights = adapter.weights
+                            # weights[0] = mat1 (lora_up), weights[1] = mat2 (lora_down), weights[2] = alpha
+                            mat1 = weights[0]  # [out_dim, rank]
+                            mat2 = weights[1]  # [rank, in_dim]
+                            alpha = weights[2] if weights[2] is not None else 1.0
+                            rank = mat2.shape[0]
+                            scale = strength_patch * strength_model * (alpha / rank)
+                            
+                            # Move to device
+                            mat1 = mat1.to(device=input.device, dtype=input_dtype)
+                            mat2 = mat2.to(device=input.device, dtype=input_dtype)
+                            
+                            # Compute: x @ mat2.T @ mat1.T * scale
+                            temp = F.linear(input, mat2)  # [B, seq, rank]
+                            lora_contrib = F.linear(temp, mat1) * scale  # [B, seq, out_dim]
+                            
+                            if lora_out is None:
+                                lora_out = lora_contrib
+                            else:
+                                lora_out = lora_out + lora_contrib
+                        else:
+                            # Fallback for non-LoRA adapters: apply the patch function to dequantized weight
+                            # This is memory-heavy but ensures correctness
+                            logging.warning(f"SDNQ Fused LoRA: Falling back to dequant for non-LoRA adapter")
+                            weight_fp = self.convert_weight(self.weight.data).to(input.device, dtype=input_dtype)
+                            patched_weight = patch_fn(weight_fp)
+                            # Compute the delta contribution
+                            lora_contrib = F.linear(input, patched_weight - weight_fp, None)
+                            if lora_out is None:
+                                lora_out = lora_contrib
+                            else:
+                                lora_out = lora_out + lora_contrib
+                else:
+                    # Non-LowVramPatch function - fall back to calling it
+                    logging.warning(f"SDNQ Fused LoRA: Unknown patch function type, falling back")
+                    weight_fp = self.convert_weight(self.weight.data).to(input.device, dtype=input_dtype)
+                    patched_weight = patch_fn(weight_fp)
+                    lora_contrib = F.linear(input, patched_weight - weight_fp, None)
+                    if lora_out is None:
+                        lora_out = lora_contrib
+                    else:
+                        lora_out = lora_out + lora_contrib
+            
+            # 3. Combine base + LoRA + bias
+            out = base_out
+            if lora_out is not None:
+                out = out + lora_out
+            
+            # Add bias
+            if self.bias is not None:
+                bias = self.bias.to(device=input.device, dtype=input_dtype)
+                out = out + bias
+            
+            return out
+
         def forward(self, *args, **kwargs):
-            if self.is_quantized or self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
+            weight = self.weight
+            if isinstance(weight, torch.nn.Parameter):
+                weight = weight.data
+            
+            # Check if we have LoRA patches AND quantized weight
+            has_lora = len(self.weight_function) > 0
+            is_quant = isinstance(weight, QuantizedTensor)
+            
+            if has_lora and is_quant:
+                # Use fused LoRA path to avoid full weight dequantization (SVD reconstruction)
+                return self.forward_fused_lora(*args, **kwargs)
+            
+            if self.is_quantized or self.comfy_cast_weights or has_lora or len(self.bias_function) > 0:
                 return self.forward_comfy_cast_weights(*args, **kwargs)
             return super().forward(*args, **kwargs)
 

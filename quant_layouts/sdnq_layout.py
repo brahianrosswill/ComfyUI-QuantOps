@@ -12,6 +12,7 @@ from typing import Tuple, Optional, Dict, Any, Union, List
 
 # Import from ComfyUI core
 from comfy.quant_ops import QuantizedTensor, register_layout_op
+import comfy.model_management
 
 # Import base layout types from comfy_kitchen
 try:
@@ -208,11 +209,14 @@ class SDNQLayout(QuantizedLayout):
 
         # 2. Add SVD correction if present
         if svd_up is not None and svd_down is not None:
-            # Robust SVD reconstruction
+            # Robust SVD reconstruction - WARNING: This dequantize path still merges SVD for the full weight
+            # Use operation handlers (like sdnq_linear) to avoid this VRAM explosion.
             svd_up_o, svd_down_o = _get_sdnq_svd_tensors(params, device=weight.device, dtype=orig_dtype)
             
-            if svd_up_o is not None and svd_down_o is not None and svd_up_o.shape[1] == svd_down_o.shape[0]:
-                correction = torch.mm(svd_up_o, svd_down_o)
+            if svd_up_o is not None and svd_down_o is not None:
+                # svd_down is [IC, R], svd_up is [R, OC]
+                # To get [OC, IC] weight correction, we need (svd_down @ svd_up).t()
+                correction = torch.mm(svd_down_o, svd_up_o).t()
                 
                 # Reshape correction to match weight if it was a conv layer
                 if weight.ndim > 2:
@@ -263,7 +267,10 @@ class SDNQLayout(QuantizedLayout):
 # --- Operation Handlers ---
 
 def _get_sdnq_svd_tensors(params, device=None, dtype=None):
-    """Robustly extract and orient SVD tensors."""
+    """
+    Extract and orient SVD tensors according to SDNQ_LAYOUT_SPEC.
+    Spec: svd_down [IC, R], svd_up [R, OC].
+    """
     svd_up = params.svd_up
     svd_down = params.svd_down
     if svd_up is None or svd_down is None:
@@ -276,227 +283,156 @@ def _get_sdnq_svd_tensors(params, device=None, dtype=None):
         svd_up = svd_up.to(dtype)
         svd_down = svd_down.to(dtype)
 
+    # Use the original non-transposed dimensions for orientation
     unpack_shape = params.unpack_shape if params.unpack_shape is not None else params.orig_shape
-    m_orig = unpack_shape[0]
-    flat_n_orig = 1
+    oc_orig = unpack_shape[0]
+    ic_orig = 1
     if len(unpack_shape) > 1:
         for d in unpack_shape[1:]:
-            flat_n_orig *= d
+            ic_orig *= d
     else:
-        flat_n_orig = unpack_shape[0]
+        ic_orig = unpack_shape[0]
 
-    # Orient correctly
-    if svd_up.shape[0] != m_orig and svd_up.shape[1] == m_orig:
-        svd_up = svd_up.t()
-    if svd_down.shape[1] != flat_n_orig and svd_down.shape[0] == flat_n_orig:
+    # Orient svd_down to [IC, R]
+    if svd_down.shape[0] != ic_orig and svd_down.shape[1] == ic_orig:
         svd_down = svd_down.t()
+    
+    # Orient svd_up to [R, OC]
+    if svd_up.shape[1] != oc_orig and svd_up.shape[0] == oc_orig:
+        svd_up = svd_up.t()
     
     return svd_up, svd_down
 
-def _sdnq_int8_matmul(input_tensor, weight_qt, bias, params):
+def _sdnq_matmul_optimized(input_tensor, weight_qt, bias, params):
     """
-    SDNQ int8 matmul - adapted from sdnext linear_int8.py
-    
-    Performs fast int8 matrix multiplication with dynamic activation quantization.
-    Fuses SVD correction with bias for efficiency.
+    Centralized optimized matmul for SDNQ.
+    Handles sequential SVD, torch._scaled_mm for Ada/Blackwell, and robust fallbacks.
     """
-    # Fallback for small batches (sdnext line 53)
-    # torch._int_mm requires batch size > 16
-    if torch.numel(input_tensor) / input_tensor.shape[-1] < 32:
-        # Dequantize and use standard float matmul for small batches
-        weight_dequant = SDNQLayout.dequantize(weight_qt._qdata, params)
-        return torch.nn.functional.linear(input_tensor, weight_dequant, bias)
-    
     device = input_tensor.device
     dtype = input_tensor.dtype
-    weight_int8 = weight_qt._qdata.to(device)  # Packed int8 weight data
+    qdata = weight_qt._qdata.to(device)
     weight_scale = params.scale.to(device, dtype=torch.float32)
     
-    # CRITICAL: Handle transposed weights correctly
+    # 1. Sequential SVD Correction (Applied to Input)
+    # This avoids VRAM explosion by never merging svd_up @ svd_down
+    if params.svd_up is not None and params.svd_down is not None:
+        svd_up, svd_down = _get_sdnq_svd_tensors(params, device, dtype)
+        # Spec correction: Output += (X_hp @ svd_down) @ svd_up
+        x_flat = input_tensor.flatten(0, -2)
+        svd_correction = torch.mm(torch.mm(x_flat, svd_down), svd_up)
+        
+        # Fuse with bias early to avoid extra [M, OC] tensors
+        if bias is not None:
+            bias = bias.to(device, dtype) + svd_correction.reshape(*input_tensor.shape[:-1], -1).to(dtype)
+        else:
+            bias = svd_correction.reshape(*input_tensor.shape[:-1], -1).to(dtype)
+
+    # 2. Main Quantized Matmul
     out_features, in_features = params.orig_shape
     output_shape = (*input_tensor.shape[:-1], out_features)
     
-    if params.transposed:
-        weight_int8 = weight_int8.reshape(in_features, out_features)  # Already [K, N]
-    else:
-        weight_int8 = weight_int8.reshape(out_features, in_features)  # [N, K]
-    
-    # Handle SVD: fuse with bias (sdnext line 38-43)
-    # Use the SAME pattern as the working dequant path (lines 427-437)
-    if params.svd_up is not None and params.svd_down is not None:
-        svd_up, svd_down = _get_sdnq_svd_tensors(params, device, dtype)
-        x_flat = input_tensor.flatten(0, -2)
-        if params.transposed:
-            # Transposed weights: svd shapes already match [in, rank] and [rank, out]
-            svd_correction = torch.mm(torch.mm(x_flat, svd_down), svd_up)
-        else:
-            # Normal: need transpose
-            svd_correction = torch.mm(torch.mm(x_flat, svd_down.t()), svd_up.t())
+    # Check for scaled_mm support (Ada/Blackwell)
+    use_scaled_mm = False
+    if hasattr(torch, "_scaled_mm") and comfy.model_management.supports_fp8_compute():
+        # torch._scaled_mm requires specific alignments and dtypes
+        if params.weights_dtype in ("float8_e4m3fn", "int8"):
+            use_scaled_mm = True
+
+    if use_scaled_mm:
+        # Dynamic quantization of input
+        input_flat = input_tensor.flatten(0, -2)
+        if params.weights_dtype == "float8_e4m3fn":
+             input_scale = torch.amax(input_flat.abs(), dim=-1, keepdim=True) / 448.0
+             input_q = (input_flat / input_scale).to(torch.float8_e4m3fn)
+        else: # int8
+             input_scale = torch.amax(input_flat.abs(), dim=-1, keepdim=True) / 127.0
+             input_q = (input_flat / input_scale).round().clamp(-128, 127).to(torch.int8)
         
-        if bias is not None:
-            bias = bias.to(device, dtype) + svd_correction.to(dtype)
+        # Weight layout: Spec says pre-transposed to [K, N] ([IC, OC])
+        # If not pre-transposed, we need to handle it.
+        w_q = qdata
+        if params.transposed:
+             w_q = w_q.reshape(in_features, out_features)
         else:
-            bias = svd_correction.to(dtype)
-    
-    # Dynamically quantize input
-    input_flat = input_tensor.flatten(0, -2).to(weight_scale.dtype)
-    input_scale = torch.amax(input_flat.abs(), dim=-1, keepdims=True) / 127.0
-    input_int8 = (input_flat / input_scale).round().clamp(-127, 127).to(torch.int8)
-    
-    # Int8 matmul: (M, K) @ (K, N) -> (M, N)
-    if params.transposed:
-        output_int32 = torch._int_mm(input_int8, weight_int8)
-    else:
-        output_int32 = torch._int_mm(input_int8, weight_int8.t())
-    
-    # Dequantize: apply scales separately to avoid creating [M, N] merged tensor
-    # Ensure scale is float32 to prevent overflow
-    if input_scale.dtype == torch.float16:
-        input_scale = input_scale.to(torch.float32)
-    if weight_scale.ndim > 1:
-        weight_scale_1d = weight_scale.reshape(-1).to(torch.float32)
-    else:
-        weight_scale_1d = weight_scale.to(torch.float32)
-    
-    # Apply scales sequentially (avoids creating merged [M,N] tensor)
-    output_fp = output_int32.to(torch.float32) * input_scale  # [M, N] * [M, 1]
-    output_fp = output_fp * weight_scale_1d.unsqueeze(0)      # [M, N] * [1, N]
-    if bias is not None:
-        output_fp = output_fp + bias.to(device, torch.float32)
-    
-    # Reshape and cast to output dtype
-    output = output_fp.reshape(output_shape)
-    return output.to(dtype)
+             w_q = w_q.reshape(out_features, in_features).t()
+        
+        # S_w must be scalar for _scaled_mm in many cases
+        s_w = weight_scale.view(-1)[0] if weight_scale.numel() > 0 else torch.tensor(1.0, device=device)
+        
+        try:
+            output_q = torch._scaled_mm(
+                input_q,
+                w_q,
+                scale_a=input_scale,
+                scale_b=s_w,
+                out_dtype=dtype
+            )
+            if bias is not None:
+                output_q = output_q.reshape(output_shape) + bias
+            else:
+                output_q = output_q.reshape(output_shape)
+            return output_q
+        except Exception as e:
+            logging.warning(f"SDNQ: _scaled_mm failed: {e}, falling back.")
+
+    # 3. Fallback to _int_mm or Dequant
+    if params.weights_dtype == "int8" and device.type == "cuda":
+        # Check alignment for _int_mm (K must be multiple of 8)
+        if in_features % 8 == 0 and torch.numel(input_tensor) / input_tensor.shape[-1] >= 16:
+            input_flat = input_tensor.flatten(0, -2)
+            input_scale = torch.amax(input_flat.abs(), dim=-1, keepdims=True) / 127.0
+            input_int8 = (input_flat / input_scale).round().clamp(-127, 127).to(torch.int8)
+            
+            w_q = qdata
+            if params.transposed:
+                w_q = w_q.reshape(in_features, out_features)
+            else:
+                w_q = w_q.reshape(out_features, in_features).t()
+            
+            try:
+                output_int32 = torch._int_mm(input_int8, w_q)
+                
+                # Apply scales sequentially (avoids creating merged [M,N] tensor)
+                s_w = weight_scale.view(1, -1) # [1, OC]
+                output_fp = (output_int32.to(dtype) * input_scale.to(dtype)) * s_w.to(dtype)
+                
+                if bias is not None:
+                    output_fp = output_fp.reshape(output_shape) + bias
+                else:
+                    output_fp = output_fp.reshape(output_shape)
+                return output_fp
+            except Exception as e:
+                logging.warning(f"SDNQ: _int_mm failed: {e}")
+
+    # 4. High-precision Dequant fallback (CPU or unaligned)
+    weight_dequant = SDNQLayout.dequantize(qdata, params).to(device, dtype)
+    return torch.nn.functional.linear(input_tensor, weight_dequant, bias)
 
 @register_layout_op(torch.ops.aten.linear.default, SDNQLayout)
 def sdnq_linear(func, args, kwargs):
     """
     SDNQ linear operation.
-    Optimized to use int8 matmul for int8 weights, dequant for others.
+    Optimized to use centralized matmul logic.
     """
     input_tensor = args[0]
     weight = args[1]
     bias = args[2] if len(args) > 2 else None
-
     if isinstance(weight, QuantizedTensor):
-        params = weight._params
-        
-        # Use int8 matmul path for int8 weights
-        if params.weights_dtype == "int8":
-            return _sdnq_int8_matmul(input_tensor, weight, bias, params)
-        
-        # Existing dequant path for other dtypes
-        
-        # Split execution if SVD is present
-        if params.svd_up is not None and params.svd_down is not None:
-            # 1. Base part (dequantize only base, with caching)
-            device = input_tensor.device
-            dtype = input_tensor.dtype
-            
-            weight_base = getattr(weight, "_sdnq_cache_base", None)
-            if weight_base is None or weight_base.device != device or weight_base.dtype != dtype:
-                base_params = SDNQLayout.Params(
-                    scale=params.scale,
-                    orig_dtype=params.orig_dtype,
-                    orig_shape=params.orig_shape,
-                    weights_dtype=params.weights_dtype,
-                    group_size=params.group_size,
-                    zero_point=params.zero_point,
-                    svd_up=None,
-                    svd_down=None,
-                    transposed=params.transposed,
-                    unpack_shape=params.unpack_shape,
-                )
-                # Ensure dequantization happens on the target device
-                qdata = weight._qdata.to(device)
-                weight_base = SDNQLayout.dequantize(qdata, base_params).to(dtype)
-                try:
-                    object.__setattr__(weight, "_sdnq_cache_base", weight_base)
-                except AttributeError:
-                    pass
-            
-            res = torch.nn.functional.linear(input_tensor, weight_base, bias)
-            
-            # 2. SVD Part (also cached if possible)
-            svd_up_o = getattr(weight, "_sdnq_cache_svd_up", None)
-            svd_down_o = getattr(weight, "_sdnq_cache_svd_down", None)
-            
-            if svd_up_o is None or svd_up_o.device != device or svd_up_o.dtype != dtype:
-                svd_up_o, svd_down_o = _get_sdnq_svd_tensors(params, device=device, dtype=dtype)
-                try:
-                    object.__setattr__(weight, "_sdnq_cache_svd_up", svd_up_o)
-                    object.__setattr__(weight, "_sdnq_cache_svd_down", svd_down_o)
-                except AttributeError:
-                    pass
-
-            if svd_up_o is not None and svd_down_o is not None:
-                # Optimized low-rank update: (X @ V) @ U^T or (X @ U) @ V
-                x_flat = input_tensor.flatten(0, -2)
-                if params.transposed:
-                    # Logical W = Q + U @ V -> X @ (Q + U @ V) = X @ Q + (X @ U) @ V
-                    # svd_up: (Out_stored, Rank), svd_down: (Rank, In_stored)
-                    res_svd = torch.mm(torch.mm(x_flat, svd_up_o), svd_down_o)
-                else:
-                    # Logical W = Q + U @ V^T -> X @ (Q^T + V @ U^T) = X @ Q^T + (X @ V) @ U^T
-                    # svd_up: (Out, Rank), svd_down: (Rank, In)
-                    res_svd = torch.mm(torch.mm(x_flat, svd_down_o.t()), svd_up_o.t())
-                res = res + res_svd.reshape(res.shape)
-            return res
-
-        # Cache dequantized weight even if no SVD
-        weight_dequant = getattr(weight, "_sdnq_cache_full", None)
-        if weight_dequant is None or weight_dequant.device != input_tensor.device or weight_dequant.dtype != input_tensor.dtype:
-            weight_dequant = weight.dequantize().to(input_tensor.device, input_tensor.dtype)
-            try:
-                object.__setattr__(weight, "_sdnq_cache_full", weight_dequant)
-            except AttributeError:
-                pass
-        weight = weight_dequant
-        
+        return _sdnq_matmul_optimized(input_tensor, weight, bias, weight._params)
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
-
     return torch.nn.functional.linear(input_tensor, weight, bias)
 
 @register_layout_op(torch.ops.aten.mm.default, SDNQLayout)
 def sdnq_mm(func, args, kwargs):
     input_tensor = args[0]
     weight = args[1]
-
     if isinstance(weight, QuantizedTensor):
-        params = weight._params
-        if params.svd_up is not None and params.svd_down is not None:
-            base_params = SDNQLayout.Params(
-                scale=params.scale,
-                orig_dtype=params.orig_dtype,
-                orig_shape=params.orig_shape,
-                weights_dtype=params.weights_dtype,
-                group_size=params.group_size,
-                zero_point=params.zero_point,
-                svd_up=None,
-                svd_down=None,
-                transposed=params.transposed,
-                unpack_shape=params.unpack_shape,
-            )
-            weight_base = SDNQLayout.dequantize(weight._qdata, base_params).to(input_tensor.device, input_tensor.dtype)
-            res = torch.mm(input_tensor, weight_base)
-            
-            svd_up, svd_down = _get_sdnq_svd_tensors(params, device=input_tensor.device, dtype=input_tensor.dtype)
-            if svd_up is not None and svd_down is not None:
-                x_flat = input_tensor.flatten(0, -2)
-                if params.transposed:
-                    res_svd = torch.mm(torch.mm(x_flat, svd_down.t()), svd_up.t())
-                else:
-                    res_svd = torch.mm(torch.mm(x_flat, svd_up), svd_down)
-                res = res + res_svd.reshape(res.shape)
-            return res
-        weight = weight.dequantize()
-        
+        return _sdnq_matmul_optimized(input_tensor, weight, None, weight._params)
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
-
     return torch.mm(input_tensor, weight)
 
 @register_layout_op(torch.ops.aten.addmm.default, SDNQLayout)
@@ -504,43 +440,14 @@ def sdnq_addmm(func, args, kwargs):
     bias = args[0]
     input_tensor = args[1]
     weight = args[2]
-
     if isinstance(weight, QuantizedTensor):
-        params = weight._params
-        if params.svd_up is not None and params.svd_down is not None:
-            base_params = SDNQLayout.Params(
-                scale=params.scale,
-                orig_dtype=params.orig_dtype,
-                orig_shape=params.orig_shape,
-                weights_dtype=params.weights_dtype,
-                group_size=params.group_size,
-                zero_point=params.zero_point,
-                svd_up=None,
-                svd_down=None,
-                transposed=params.transposed,
-                unpack_shape=params.unpack_shape,
-            )
-            weight_base = SDNQLayout.dequantize(weight._qdata, base_params).to(input_tensor.device, input_tensor.dtype)
-            res = torch.addmm(bias, input_tensor, weight_base, **kwargs)
-            
-            svd_up, svd_down = _get_sdnq_svd_tensors(params, device=input_tensor.device, dtype=input_tensor.dtype)
-            if svd_up is not None and svd_down is not None:
-                x_flat = input_tensor.flatten(0, -2)
-                if params.transposed:
-                    res_svd = torch.mm(torch.mm(x_flat, svd_down.t()), svd_up.t())
-                else:
-                    res_svd = torch.mm(torch.mm(x_flat, svd_up), svd_down)
-                res = res + res_svd.reshape(res.shape)
-            return res
-        weight = weight.dequantize()
-
+        return _sdnq_matmul_optimized(input_tensor, weight, bias, weight._params)
     if isinstance(bias, QuantizedTensor):
         bias = bias.dequantize()
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
-
     return torch.addmm(bias, input_tensor, weight, **kwargs)
 
 @register_layout_op(torch.ops.aten.convolution.default, SDNQLayout)
