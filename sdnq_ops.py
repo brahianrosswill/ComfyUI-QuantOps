@@ -113,6 +113,7 @@ class SDNQLayerMixin:
             )
             
             # Wrap in QuantizedTensor
+            # Note: comfy_kitchen QuantizedTensor requires layout name as string
             self.weight = torch.nn.Parameter(
                 QuantizedTensor(qdata, "SDNQLayout", layout_params),
                 requires_grad=False
@@ -205,6 +206,13 @@ class HybridSDNQOps(manual_cast):
             """
             input_dtype = input.dtype
             
+            # Log usage of fused LoRA path
+            if not hasattr(self.__class__, "_fused_lora_log_count"):
+                self.__class__._fused_lora_log_count = 0
+            if self.__class__._fused_lora_log_count < 1:
+                logging.info(f"SDNQ: Using memory-efficient fused LoRA path for {input.shape}")
+                self.__class__._fused_lora_log_count += 1
+
             # 1. Base SDNQ output (no LoRA applied, no bias applied yet)
             # We explicitly pass bias=None to get just the matmul result
             base_out = self._sdnq_forward(input, bias=None)
@@ -291,7 +299,8 @@ class HybridSDNQOps(manual_cast):
             
             # Check if we have LoRA patches AND quantized weight
             has_lora = len(self.weight_function) > 0
-            is_quant = isinstance(weight, QuantizedTensor)
+            # Also check for raw uint8 (packed SDNQ storage)
+            is_quant = isinstance(weight, QuantizedTensor) or (getattr(self, "is_quantized", False) and weight.dtype == torch.uint8)
             
             if has_lora and is_quant:
                 # Use fused LoRA path to avoid full weight dequantization (SVD reconstruction)
