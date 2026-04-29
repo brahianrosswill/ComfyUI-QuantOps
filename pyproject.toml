@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-QuantOps"
 description = "Extended quantization layouts for ComfyUI (INT8, row/block-wise FP8)"
-version = "1.8.0"
+version = "1.8.1"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "unifiedefficientloader>=0.2.1"
+    "unifiedefficientloader==0.4.4"
 ]
 
 [project.urls]
