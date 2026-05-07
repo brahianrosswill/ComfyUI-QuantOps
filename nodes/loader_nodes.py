@@ -191,7 +191,7 @@ def _configure_int8_backend(kernel_backend):
         if kernel_backend == "triton":
             ck.set_backend_priority(["triton", "cuda", "eager"])
         else:
-            ck.set_backend_priority(["cuda", "eager", "triton"])
+            ck.set_backend_priority(["cuda", "triton", "eager"])
         logging.debug(f"Configured backend priority for '{kernel_backend}'")
     except ImportError:
         try:
