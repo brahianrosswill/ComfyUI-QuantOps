@@ -160,27 +160,45 @@ class UnifiedQuantOps:
                     if self.block_size is None:
                         self.block_size = 128
 
+                    def _is_per_channel_scale(s, weight_n):
+                        """True if scale is per-row/per-channel: shape [N] or [N, 1]."""
+                        if s is None:
+                            return False
+                        return (
+                            (s.ndim == 1 and s.numel() == weight_n)
+                            or (s.ndim == 2 and s.shape[0] == weight_n and s.shape[1] == 1)
+                        )
+
+                    is_scalar_scale = scale is not None and (
+                        scale.ndim == 0
+                        or (scale.ndim == 1 and scale.shape[0] == 1)
+                    )
+                    is_per_channel = _is_per_channel_scale(scale, weight_tensor.shape[0])
+
                     is_tensorwise = self.quant_format == "int8_tensorwise" or (
                         self.quant_format is None
-                        and (
-                            scale is not None
-                            and (
-                                scale.ndim == 0
-                                or (scale.ndim == 1 and scale.shape[0] == 1)
-                            )
-                        )
+                        and (is_scalar_scale or is_per_channel)
                     )
 
                     if is_tensorwise and _HAS_TENSORWISE_INT8_LAYOUT:
                         self.layout_type = "TensorWiseINT8Layout"
-                        layout_params = TensorWiseINT8Layout.Params(
-                            scale=scale.to(torch.float32)
-                            if scale is not None
-                            else None,
+                        # Determine if comfy_kitchen TensorWiseINT8Layout.Params
+                        # supports per_channel (added in feature/int8-tensorwise).
+                        # Fall back gracefully if the field does not exist yet.
+                        params_kwargs = dict(
+                            scale=scale.to(torch.float32) if scale is not None else None,
                             orig_dtype=torch.bfloat16,
                             orig_shape=tuple(weight_tensor.shape),
                             is_weight=True,
                         )
+                        try:
+                            import dataclasses
+                            field_names = {f.name for f in dataclasses.fields(TensorWiseINT8Layout.Params)}
+                            if "per_channel" in field_names and is_per_channel:
+                                params_kwargs["per_channel"] = True
+                        except Exception:
+                            pass
+                        layout_params = TensorWiseINT8Layout.Params(**params_kwargs)
                         self.weight = torch.nn.Parameter(
                             QuantizedTensor(
                                 weight_tensor, self.layout_type, layout_params
