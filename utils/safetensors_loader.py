@@ -248,6 +248,12 @@ def _infer_layer_format(weight, scale, scale_2):
     if weight.dtype == torch.int8 and scale is not None:
         if scale.ndim == 0 or (scale.ndim == 1 and scale.numel() == 1):
             return {"format": "int8_tensorwise"}
+        # Per-channel (per-row) scale: [N] or [N, 1] where N == weight.shape[0]
+        if (
+            (scale.ndim == 1 and scale.numel() == weight.shape[0])
+            or (scale.ndim == 2 and scale.shape[0] == weight.shape[0] and scale.shape[1] == 1)
+        ):
+            return {"format": "int8_tensorwise"}
         return {"format": "int8"}
 
     # FP8: float8 weight with a scale tensor
