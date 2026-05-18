@@ -10,21 +10,24 @@ I don't have the time or the energy to keep this up and will close entire projec
 
 ### The following is the last update I make regarding this.
 
-In order to use int8_tensorwise(RTX 30xx-series or newer GPU) or mxfp8(RTX 50xx-series/Blackwell GPU) you will need the following:
+In order to use int8_tensorwise(RTX 30xx-series or newer GPU) you will need the following:
 
-- torch 2.10+cu130
-- installed the latest of my custom comfy-kitchen fork
-- For int8 you also need to merge my PR https://github.com/Comfy-Org/ComfyUI/pull/12730
+- torch 2.10+cu130 or higher
+- installed the latest of my custom comfy-kitchen fork wheels with the int8-tensorwise support
+- enable the use of triton backend by using --enable-triton-backend launch argument in ComfyUI
 
 Step 1: Install Triton
 Activate your virtual environment used by ComfyUI and install triton.
 For Windows you need to use this but linux can install latest triton as usual.
 ```
-pip install -U "triton-windows<3.7
+# for torch 2.10 and 2.11
+pip install -U "triton-windows<3.7"
+# for torch 2.12
+pip install -U "triton-windows<3.8"
 ```
 
 Step 3: Install my comfy-kitchen
-Download the latest uploaded version matching you python of my pre-compiled .whl file from my [HuggingFace repository](https://huggingface.co/silveroxides/Chroma1-HD-fp8-scaled/tree/main/experimental)
+Download the latest uploaded version matching you python of my pre-compiled .whl file from my [HuggingFace repository](https://huggingface.co/silveroxides/Chroma1-HD-fp8-scaled/tree/main/experimental/comfy-kitchen-0.2.8-int8row) (Latest as of 18 May 2026)
 
 Install it directly pointing to the file path:
 ```
@@ -38,14 +41,6 @@ Run these commands:
 ```
 cd custom_nodes/ComfyUI-QuantOps
 git pull
-```
-Step 5: Apply the "Triton PR" to Core ComfyUI
-
-you can pull that specific code into a testing branch using these commands:
-
-```
-git fetch origin pull/12730/head:triton-testing
-git checkout triton-testing
 ```
 
 When launching Comfyui add launch argument:
