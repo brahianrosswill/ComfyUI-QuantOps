@@ -123,7 +123,7 @@ def mmap_load_safetensors(filepath):
 
     # --- 4. Build state dict with mmap-backed stamped tensors ---
     sd = {}
-    thread_id = threading.get_ident()
+    file_lock = threading.Lock()
 
     for name in all_keys:
         info = header[name]
@@ -153,7 +153,7 @@ def mmap_load_safetensors(filepath):
                     storage,
                     "_comfy_tensor_file_slice",
                     TensorFileSlice(
-                        f, thread_id, data_base_offset + start, end - start
+                        f, file_lock, data_base_offset + start, end - start
                     ),
                 )
                 # Keeps model_mmap and memoryview alive while any tensor is alive
