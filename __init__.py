@@ -33,12 +33,11 @@ def is_ck_triton_available() -> bool:
 def _setup_comfy_kitchen_backends():
     """
     Configure comfy-kitchen backends for QuantOps.
-    
+
     1. Re-enable triton backend (ComfyUI disables it by default)
-    2. Register QuantOps kernels as a custom backend
     """
     global _CK_AVAILABLE, _CK_TRITON_AVAILABLE
-    
+
     try:
         import comfy_kitchen as ck
         _CK_AVAILABLE = True
@@ -47,14 +46,14 @@ def _setup_comfy_kitchen_backends():
         _CK_AVAILABLE = False
         _CK_TRITON_AVAILABLE = False
         return
-    
+
     # Step 1: Re-enable triton backend (ComfyUI disables it)
     try:
         ck.enable_backend("triton")
-        
+
         backends = ck.list_backends()
         triton_info = backends.get("triton", {})
-        
+
         if triton_info.get("available") and not triton_info.get("disabled"):
             _CK_TRITON_AVAILABLE = True
             logging.info("ComfyUI-QuantOps: Enabled comfy-kitchen triton backend")
@@ -62,128 +61,10 @@ def _setup_comfy_kitchen_backends():
             unavail_reason = triton_info.get("unavailable_reason", "unknown")
             logging.info(f"ComfyUI-QuantOps: comfy-kitchen triton unavailable: {unavail_reason}")
             _CK_TRITON_AVAILABLE = False
-            
+
     except Exception as e:
         logging.warning(f"ComfyUI-QuantOps: Failed to enable ck triton backend: {e}")
         _CK_TRITON_AVAILABLE = False
-    
-    # Step 2: Register QuantOps kernels as a custom backend
-    _register_quantops_backend()
-
-
-def _register_quantops_backend():
-    """
-    Register QuantOps Triton kernels with comfy-kitchen registry.
-    
-    This allows ck dispatch to use our INT8/FP8 kernels.
-    """
-    try:
-        import torch
-        from comfy_kitchen.registry import registry
-        from comfy_kitchen.constraints import (
-            FunctionConstraints,
-            ParamConstraint,
-            ExactDims,
-            DivisibleBy,
-        )
-        
-        # Import our kernel modules
-        from .kernels import int8_kernels
-        from .kernels import fp8_kernels
-        
-        cuda_devices = frozenset({"cuda"})
-        standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
-        
-        # Build constraints for INT8 kernels
-        int8_constraints = {
-            "act_quant": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(
-                        dtypes=standard_floats,
-                        shape_rules=(DivisibleBy(-1, 128),),  # Last dim divisible by block_size
-                    ),
-                },
-                default_devices=cuda_devices,
-            ),
-            "act_dequant": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(dtypes=frozenset({torch.int8})),
-                    "s": ParamConstraint(dtypes=frozenset({torch.float32})),
-                },
-                default_devices=cuda_devices,
-            ),
-            "weight_quant": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(
-                        dtypes=standard_floats,
-                        shape_rules=(ExactDims(2),),
-                    ),
-                },
-                default_devices=cuda_devices,
-            ),
-            "weight_dequant": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(dtypes=frozenset({torch.int8})),
-                    "s": ParamConstraint(dtypes=frozenset({torch.float32})),
-                },
-                default_devices=cuda_devices,
-            ),
-        }
-        
-        # Build constraints for FP8 kernels
-        fp8_constraints = {
-            "fp8_act_quant": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(dtypes=standard_floats),
-                },
-                default_devices=cuda_devices,
-            ),
-            "fp8_gemm_blockwise": FunctionConstraints(
-                params={
-                    "a": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
-                    "b": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
-                    "a_s": ParamConstraint(dtypes=frozenset({torch.float32})),
-                    "b_s": ParamConstraint(dtypes=frozenset({torch.float32})),
-                },
-                default_devices=cuda_devices,
-            ),
-            "fp8_gemm_rowwise": FunctionConstraints(
-                params={
-                    "a": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
-                    "b": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
-                    "a_s": ParamConstraint(dtypes=frozenset({torch.float32})),
-                    "b_s": ParamConstraint(dtypes=frozenset({torch.float32})),
-                },
-                default_devices=cuda_devices,
-            ),
-        }
-        
-        # Register INT8 backend
-        try:
-            registry.register(
-                name="quantops_int8",
-                module=int8_kernels,
-                capabilities=int8_constraints,
-            )
-            logging.info("ComfyUI-QuantOps: Registered quantops_int8 backend")
-        except Exception as e:
-            logging.debug(f"ComfyUI-QuantOps: Could not register INT8 backend: {e}")
-        
-        # Register FP8 backend
-        try:
-            registry.register(
-                name="quantops_fp8",
-                module=fp8_kernels,
-                capabilities=fp8_constraints,
-            )
-            logging.info("ComfyUI-QuantOps: Registered quantops_fp8 backend")
-        except Exception as e:
-            logging.debug(f"ComfyUI-QuantOps: Could not register FP8 backend: {e}")
-            
-    except ImportError as e:
-        logging.debug(f"ComfyUI-QuantOps: Could not register backends (missing deps): {e}")
-    except Exception as e:
-        logging.warning(f"ComfyUI-QuantOps: Backend registration failed: {e}")
 
 
 # =============================================================================
