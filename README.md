@@ -27,7 +27,7 @@ pip install -U "triton-windows<3.8"
 ```
 
 Step 3: Install my comfy-kitchen
-Download the latest uploaded version matching you python of my pre-compiled .whl file from my [HuggingFace repository](https://huggingface.co/silveroxides/Chroma1-HD-fp8-scaled/tree/main/experimental/comfy-kitchen-0.2.8-int8row) (Latest as of 18 May 2026)
+Download the latest uploaded version matching you python of my pre-compiled .whl file from my [HuggingFace repository](https://huggingface.co/silveroxides/comfy-kitchen-int8-wheels/tree/main) (Latest as of 29 May 2026)
 
 Install it directly pointing to the file path:
 ```
