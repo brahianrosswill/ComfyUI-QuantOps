@@ -324,11 +324,11 @@ class QuantizedModelLoader:
                     ],
                 ),
                 "kernel_backend": (["pytorch", "triton"],),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
+                "disable_dynamic": ("BOOLEAN", {"default": False}),
                 "low_memory": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use fast and efficient low impact loading of model. Set to False to use comfy's default loading.",
                     },
                 ),
@@ -436,11 +436,11 @@ class QuantizedUNETLoader:
                     ],
                 ),
                 "kernel_backend": (["pytorch", "triton"],),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
+                "disable_dynamic": ("BOOLEAN", {"default": False}),
                 "low_memory": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use fast and efficient low impact loading of model. Set to False to use comfy's default loading.",
                     },
                 ),
@@ -540,11 +540,11 @@ class QuantizedCLIPLoader:
                     ],
                 ),
                 "kernel_backend": (["pytorch", "triton"],),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
+                "disable_dynamic": ("BOOLEAN", {"default": False}),
                 "low_memory": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use fast and efficient low impact loading of model. Set to False to use comfy's default loading.",
                     },
                 ),
@@ -659,11 +659,11 @@ class QuantizedDualCLIPLoader:
                     ],
                 ),
                 "kernel_backend": (["pytorch", "triton"],),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
+                "disable_dynamic": ("BOOLEAN", {"default": False}),
                 "low_memory": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use fast and efficient low impact loading of model. Set to False to use comfy's default loading.",
                     },
                 ),
@@ -1102,11 +1102,11 @@ class QuantizedModelLoaderSimple:
         return {
             "required": {
                 "ckpt_name": (folder_paths.get_filename_list("checkpoints"),),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
+                "disable_dynamic": ("BOOLEAN", {"default": False}),
                 "low_memory": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use fast and efficient low impact loading of model. Set to False to use comfy's default loading.",
                     },
                 ),
@@ -1134,11 +1134,11 @@ class QuantizedUNETLoaderSimple:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
+                "disable_dynamic": ("BOOLEAN", {"default": False}),
                 "low_memory": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use fast and efficient low impact loading of model. Set to False to use comfy's default loading.",
                     },
                 ),
@@ -1165,11 +1165,11 @@ class QuantizedCLIPLoaderSimple:
             "required": {
                 "clip_name": (folder_paths.get_filename_list("text_encoders"),),
                 "type": (QuantizedCLIPLoader.CLIP_TYPES,),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
+                "disable_dynamic": ("BOOLEAN", {"default": False}),
                 "low_memory": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use fast and efficient low impact loading of model. Set to False to use comfy's default loading.",
                     },
                 ),
@@ -1201,11 +1201,11 @@ class QuantizedDualCLIPLoaderSimple:
                 "text_encoder1": (te_list,),
                 "text_encoder2": (te_and_ckpt_list,),
                 "type": (QuantizedDualCLIPLoader.CLIP_TYPES,),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
+                "disable_dynamic": ("BOOLEAN", {"default": False}),
                 "low_memory": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use fast and efficient low impact loading of model. Set to False to use comfy's default loading.",
                     },
                 ),
@@ -1247,7 +1247,7 @@ class EfficientVAELoader:
                 "low_memory": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use fast and efficient low impact loading of model. Set to False to use comfy's default loading.",
                     },
                 ),
