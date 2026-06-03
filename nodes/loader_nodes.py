@@ -514,10 +514,13 @@ class QuantizedCLIPLoader:
         "omnigen2",
         "qwen_image",
         "hunyuan_image",
-        "flux",
-        "hunyuan_video",
         "flux2",
         "ovis",
+        "longcat_image",
+        "cogvideox",
+        "lens",
+        "pixeldit",
+        "ideogram4"
     ]
 
     @classmethod
@@ -631,7 +634,7 @@ class QuantizedDualCLIPLoader:
         "kandinsky5_image",
         "ltxv",
         "newbie",
-        "ace",
+        "ace"
     ]
 
     @classmethod
