@@ -102,6 +102,10 @@ class UnifiedQuantOps:
             self.quant_format = layer_conf.get("format", None)
             self.block_size = layer_conf.get("group_size", None)
 
+            # Extract convrot parameters
+            self.convrot = layer_conf.get("convrot", False)
+            self.convrot_groupsize = layer_conf.get("convrot_groupsize", 256)
+
             # 3. Load weight and initialize QuantizedTensor based on dtype
             weight_tensor = state_dict.pop(weight_key, None)
 
@@ -196,6 +200,10 @@ class UnifiedQuantOps:
                             field_names = {f.name for f in dataclasses.fields(TensorWiseINT8Layout.Params)}
                             if "per_channel" in field_names and is_per_channel:
                                 params_kwargs["per_channel"] = True
+                            if "convrot" in field_names:
+                                params_kwargs["convrot"] = self.convrot
+                            if "convrot_groupsize" in field_names:
+                                params_kwargs["convrot_groupsize"] = self.convrot_groupsize
                         except Exception:
                             pass
                         layout_params = TensorWiseINT8Layout.Params(**params_kwargs)
