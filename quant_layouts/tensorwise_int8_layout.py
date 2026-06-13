@@ -3,7 +3,10 @@ import logging
 
 try:
     from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
-    from comfy_kitchen.tensor.int8 import tensorwise_int8_linear as orig_linear
+    try:
+        from comfy_kitchen.tensor.int8 import _handle_int8_linear_tensorwise as orig_linear
+    except ImportError:
+        from comfy_kitchen.tensor.int8 import tensorwise_int8_linear as orig_linear
     from comfy.quant_ops import register_layout_op, QuantizedTensor
     from ..kernels.int8_kernels import int8_linear_per_channel
 
@@ -13,9 +16,15 @@ try:
         weight = args[1]
         bias = args[2] if len(args) > 2 else None
 
+        # Check if weight has convrot enabled. If so, do NOT bypass comfy-kitchen.
+        if isinstance(weight, QuantizedTensor) and getattr(weight._params, "convrot", False):
+            return orig_linear(func, args, kwargs)
+
         if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-            plain_weight, scale_b, _, _ = TensorWiseINT8Layout.get_plain_tensors(weight)
-            
+            tensors = TensorWiseINT8Layout.get_plain_tensors(weight)
+            plain_weight = tensors[0]
+            scale_b = tensors[1]
+
             # Check if scale is per-row/per-channel (shape [N] or [N, 1])
             # If so, use our custom fallback instead of comfy_kitchen's which might not support it
             if scale_b.numel() > 1:
@@ -25,17 +34,19 @@ try:
                 except Exception as e:
                     logging.warning(f"Row-wise INT8 linear failed, falling back: {e}")
                     return torch.nn.functional.linear(input_tensor.dequantize(), weight.dequantize(), bias)
-            
+
         elif not isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-            plain_weight, scale_b, _, _ = TensorWiseINT8Layout.get_plain_tensors(weight)
-            
+            tensors = TensorWiseINT8Layout.get_plain_tensors(weight)
+            plain_weight = tensors[0]
+            scale_b = tensors[1]
+
             if scale_b.numel() > 1:
                 try:
                     return int8_linear_per_channel(input_tensor, plain_weight, scale_b, bias)
                 except Exception as e:
                     logging.warning(f"Row-wise INT8 linear dynamic act quant failed, falling back: {e}")
                     return torch.nn.functional.linear(input_tensor, weight.dequantize(), bias)
-                    
+
         # Fallback to original comfy_kitchen implementation
         return orig_linear(func, args, kwargs)
 
